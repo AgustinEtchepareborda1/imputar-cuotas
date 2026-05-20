@@ -418,11 +418,14 @@ def procesar(
             'fecha': fecha_dt,
         })
 
-    return results, pago_menos, ambiguous, wb_imp, wb_deu_edit, mes_info, sheets_cfg
+    return results, pago_menos, ambiguous, mes_info, sheets_cfg
 
 
-def aplicar(results, pago_menos, wb_imp, wb_deu_edit, imp_sheet, sheets_cfg):
-    """Escribe en los workbooks. Retorna (imp_bytes, deu_bytes)."""
+def aplicar(results, pago_menos, imp_bytes, deu_bytes, imp_sheet, sheets_cfg):
+    """Carga los workbooks desde bytes, escribe y retorna (imp_bytes, deu_bytes)."""
+    wb_imp = openpyxl.load_workbook(io.BytesIO(imp_bytes))
+    wb_deu_edit = openpyxl.load_workbook(io.BytesIO(deu_bytes))
+
     ws_edit = wb_imp[imp_sheet]
 
     for p in pago_menos:

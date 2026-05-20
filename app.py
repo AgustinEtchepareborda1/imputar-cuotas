@@ -1,6 +1,7 @@
 import io
 import os
 import re
+import traceback
 import openpyxl
 import streamlit as st
 import pandas as pd
@@ -10,14 +11,16 @@ from comprobantes_helper import cargar_indice
 
 st.set_page_config(page_title="Imputar Cuotas - FINK", page_icon="📊", layout="wide")
 
-CACHE_PATH = os.path.join(os.path.dirname(__file__), 'datos', 'comprobantes_cache.json')
+CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'datos', 'comprobantes_cache.json')
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def leer_hojas(file_bytes):
     try:
         wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True)
-        return wb.sheetnames
+        names = wb.sheetnames
+        wb.close()
+        return names
     except Exception:
         return []
 
@@ -65,79 +68,80 @@ def fmt_dif(val, es_usd):
 
 st.title('📊 Imputar Cuotas - FINK')
 
-col1, col2 = st.columns(2)
-with col1:
-    imp_file = st.file_uploader('Archivo de imputaciones (.xlsx)', type='xlsx', key='imp_upload')
-with col2:
-    deu_file = st.file_uploader('Archivo de deudores (.xlsx)', type='xlsx', key='deu_upload')
+try:
+    col1, col2 = st.columns(2)
+    with col1:
+        imp_file = st.file_uploader('Archivo de imputaciones (.xlsx)', type='xlsx', key='imp_upload')
+    with col2:
+        deu_file = st.file_uploader('Archivo de deudores (.xlsx)', type='xlsx', key='deu_upload')
 
-if not imp_file or not deu_file:
-    st.info('Subí ambos archivos para continuar.')
-    st.stop()
-
-imp_bytes = imp_file.read()
-deu_bytes = deu_file.read()
-
-hojas = leer_hojas(imp_bytes)
-if not hojas:
-    st.error('No se pudo leer el archivo de imputaciones.')
-    st.stop()
-
-h_pesos = hojas_pesos(hojas)
-h_usd = hojas_usd(hojas)
-
-if not h_pesos and not h_usd:
-    st.error('No se encontraron hojas de semanas (formato "S 121" o "USD 5") en el archivo de imputaciones.')
-    st.stop()
-
-st.divider()
-col_tipo, col_semana, col_tol, col_maxrow = st.columns([1, 2, 1, 1])
-
-with col_tipo:
-    tipo = st.radio('Tipo', ['Pesos', 'USD'], horizontal=True)
-
-es_usd = tipo == 'USD'
-opciones_semana = h_usd if es_usd else h_pesos
-
-with col_semana:
-    if not opciones_semana:
-        st.warning(f'No hay hojas de tipo {"USD" if es_usd else "Pesos"} en el archivo.')
+    if not imp_file or not deu_file:
+        st.info('Subí ambos archivos para continuar.')
         st.stop()
-    semana = st.selectbox('Semana', opciones_semana, index=len(opciones_semana) - 1)
 
-with col_tol:
-    tolerancia = st.number_input(
-        'Tolerancia',
-        min_value=0,
-        value=5 if es_usd else 3000,
-        help='Diferencia máxima aceptable (USD o $) para imputar sin marcar "PAGO MENOS"'
-    )
+    imp_bytes = imp_file.read()
+    deu_bytes = deu_file.read()
 
-with col_maxrow:
-    max_row = st.number_input('Filas máx.', min_value=1, value=500, help='Hasta qué fila procesar en la hoja de imputaciones')
+    hojas = leer_hojas(imp_bytes)
+    if not hojas:
+        st.error('No se pudo leer el archivo de imputaciones.')
+        st.stop()
 
-with st.expander('Overrides manuales de cuota'):
-    st.caption('Una línea por CUIT en formato: `CUIT: número_cuota`  ej: `20358346740: 12`')
-    override_text = st.text_area('CUOTA_OVERRIDE', value='', height=100, label_visibility='collapsed')
+    h_pesos = hojas_pesos(hojas)
+    h_usd = hojas_usd(hojas)
 
-cuota_override = parse_cuota_override(override_text)
+    if not h_pesos and not h_usd:
+        st.error('No se encontraron hojas de semanas (formato "S 121" o "USD 5") en el archivo.')
+        st.stop()
 
-st.divider()
+    st.divider()
+    col_tipo, col_semana, col_tol, col_maxrow = st.columns([1, 2, 1, 1])
 
-# ── Simular ───────────────────────────────────────────────────────────────────
+    with col_tipo:
+        tipo = st.radio('Tipo', ['Pesos', 'USD'], horizontal=True)
 
-if st.button('🔍 Simular', type='primary', use_container_width=True):
-    comprobantes_cache = cargar_indice(CACHE_PATH) if os.path.exists(CACHE_PATH) else {}
-    logs = []
+    es_usd = tipo == 'USD'
+    opciones_semana = h_usd if es_usd else h_pesos
 
-    with st.spinner('Procesando...'):
-        try:
-            results, pago_menos, ambiguous, wb_imp, wb_deu_edit, mes_info, sheets_cfg = procesar(
+    with col_semana:
+        if not opciones_semana:
+            st.warning(f'No hay hojas de tipo {"USD" if es_usd else "Pesos"} en el archivo.')
+            st.stop()
+        semana = st.selectbox('Semana', opciones_semana, index=len(opciones_semana) - 1)
+
+    with col_tol:
+        tolerancia = st.number_input(
+            'Tolerancia',
+            min_value=0,
+            value=5 if es_usd else 3000,
+            help='Diferencia máxima aceptable para imputar sin marcar "PAGO MENOS"'
+        )
+
+    with col_maxrow:
+        max_row = st.number_input('Filas máx.', min_value=1, value=500,
+                                  help='Hasta qué fila procesar en la hoja de imputaciones')
+
+    with st.expander('Overrides manuales de cuota'):
+        st.caption('Una línea por CUIT: `20358346740: 12`')
+        override_text = st.text_area('CUOTA_OVERRIDE', value='', height=100, label_visibility='collapsed')
+
+    cuota_override = parse_cuota_override(override_text)
+
+    st.divider()
+
+    # ── Simular ───────────────────────────────────────────────────────────────
+
+    if st.button('🔍 Simular', type='primary', use_container_width=True):
+        comprobantes_cache = cargar_indice(CACHE_PATH) if os.path.exists(CACHE_PATH) else {}
+        logs = []
+
+        with st.spinner('Procesando...'):
+            results, pago_menos, ambiguous, mes_info, sheets_cfg = procesar(
                 imp_bytes=imp_bytes,
                 deu_bytes=deu_bytes,
                 imp_sheet=semana,
                 es_usd=es_usd,
-                tolerance=tolerancia,
+                tolerance=int(tolerancia),
                 max_row=int(max_row),
                 cuota_override=cuota_override,
                 comprobantes_cache=comprobantes_cache,
@@ -147,113 +151,107 @@ if st.button('🔍 Simular', type='primary', use_container_width=True):
                 'results': results,
                 'pago_menos': pago_menos,
                 'ambiguous': ambiguous,
-                'wb_imp': wb_imp,
-                'wb_deu_edit': wb_deu_edit,
                 'mes_info': mes_info,
                 'sheets_cfg': sheets_cfg,
                 'semana': semana,
                 'es_usd': es_usd,
+                'imp_bytes': imp_bytes,
+                'deu_bytes': deu_bytes,
                 'imp_name': imp_file.name,
                 'deu_name': deu_file.name,
-                'imp_out': None,
-                'deu_out': None,
             }
             st.session_state.pop('descarga', None)
-        except Exception as e:
-            st.error(f'Error al procesar: {e}')
-            st.stop()
 
-    if logs:
-        with st.expander('Log de resoluciones'):
-            st.code('\n'.join(logs))
+        if logs:
+            with st.expander('Log de resoluciones'):
+                st.code('\n'.join(logs))
 
-# ── Mostrar resultados ────────────────────────────────────────────────────────
+    # ── Mostrar resultados ────────────────────────────────────────────────────
 
-sim = st.session_state.get('sim')
-if not sim:
-    st.stop()
+    sim = st.session_state.get('sim')
+    if not sim:
+        st.stop()
 
-results = sim['results']
-pago_menos = sim['pago_menos']
-ambiguous = sim['ambiguous']
-es_usd_sim = sim['es_usd']
+    results = sim['results']
+    pago_menos = sim['pago_menos']
+    ambiguous = sim['ambiguous']
+    es_usd_sim = sim['es_usd']
 
-mes_vals = list(sim['mes_info'].values())
-mes_label = mes_vals[0] if mes_vals else '?'
-st.caption(f'Mes detectado en deudores: **{mes_label}**')
+    mes_vals = list(sim['mes_info'].values())
+    mes_label = mes_vals[0] if mes_vals else '?'
+    st.caption(f'Mes detectado en deudores: **{mes_label}**')
 
-total = len(results) + len(pago_menos) + len(ambiguous)
-c1, c2, c3, c4 = st.columns(4)
-c1.metric('Total filas', total)
-c2.metric('✅ Para imputar', len(results))
-c3.metric('⚠️ Pago menos', len(pago_menos))
-c4.metric('❌ Ambiguos', len(ambiguous))
+    total = len(results) + len(pago_menos) + len(ambiguous)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric('Total filas', total)
+    c2.metric('✅ Para imputar', len(results))
+    c3.metric('⚠️ Pago menos', len(pago_menos))
+    c4.metric('❌ Ambiguos', len(ambiguous))
 
-if results:
-    st.subheader(f'✅ Para imputar ({len(results)})')
-    rows_ok = []
-    for r in results:
-        rows_ok.append({
-            'Fila': r['imp_row'],
-            'Cliente': f"{r['cliente']}{r['lote_str']}",
-            'CUIT': r['cuit'],
-            'Monto real': fmt_monto(r['monto_real'], es_usd_sim),
-            'Teórico': fmt_monto(r['monto_teo'], es_usd_sim),
-            'Diferencia': fmt_dif(r['diferencia'], es_usd_sim),
-            'Cuota': r['cuota'],
-            'Fecha': r['fecha'].strftime('%d/%m/%Y') if r['fecha'] else '?',
-            'Hoja deudores': r['hoja'],
-        })
-    st.dataframe(pd.DataFrame(rows_ok), use_container_width=True, hide_index=True)
+    if results:
+        st.subheader(f'✅ Para imputar ({len(results)})')
+        rows_ok = []
+        for r in results:
+            rows_ok.append({
+                'Fila': r['imp_row'],
+                'Cliente': f"{r['cliente']}{r['lote_str']}",
+                'CUIT': r['cuit'],
+                'Monto real': fmt_monto(r['monto_real'], es_usd_sim),
+                'Teórico': fmt_monto(r['monto_teo'], es_usd_sim),
+                'Diferencia': fmt_dif(r['diferencia'], es_usd_sim),
+                'Cuota': r['cuota'],
+                'Fecha': r['fecha'].strftime('%d/%m/%Y') if r['fecha'] else '?',
+                'Hoja deudores': r['hoja'],
+            })
+        st.dataframe(pd.DataFrame(rows_ok), use_container_width=True, hide_index=True)
 
-if pago_menos:
-    st.subheader(f'⚠️ Pago menos ({len(pago_menos)}) — se escribirá "PAGO MENOS" en col H')
-    rows_pm = []
-    for p in pago_menos:
-        rows_pm.append({
-            'Fila': p['row'],
-            'Cliente': p['cliente'],
-            'CUIT': p['cuit'],
-            'Transferido': fmt_monto(p['transferido'], es_usd_sim),
-            'Teórico': fmt_monto(p['teorico'], es_usd_sim),
-            'Diferencia': fmt_monto(p['diferencia'], es_usd_sim),
-        })
-    st.dataframe(pd.DataFrame(rows_pm), use_container_width=True, hide_index=True)
+    if pago_menos:
+        st.subheader(f'⚠️ Pago menos ({len(pago_menos)}) — se escribirá "PAGO MENOS" en col H')
+        rows_pm = []
+        for p in pago_menos:
+            rows_pm.append({
+                'Fila': p['row'],
+                'Cliente': p['cliente'],
+                'CUIT': p['cuit'],
+                'Transferido': fmt_monto(p['transferido'], es_usd_sim),
+                'Teórico': fmt_monto(p['teorico'], es_usd_sim),
+                'Diferencia': fmt_monto(p['diferencia'], es_usd_sim),
+            })
+        st.dataframe(pd.DataFrame(rows_pm), use_container_width=True, hide_index=True)
 
-if ambiguous:
-    st.subheader(f'❌ Casos ambiguos ({len(ambiguous)}) — no se imputan, revisar manualmente')
-    rows_amb = []
-    for a in ambiguous:
-        cliente = a.get('cliente', a.get('concepto', ''))
-        monto = a.get('monto', '')
-        monto_str = fmt_monto(monto, es_usd_sim) if isinstance(monto, (int, float)) else str(monto) if monto else ''
-        matches_str = str(a.get('matches', '')) if a.get('matches') else ''
-        rows_amb.append({
-            'Fila': a.get('row', '?'),
-            'Motivo': a.get('motivo', ''),
-            'Cliente / Concepto': str(cliente)[:60] if cliente else '',
-            'Monto': monto_str,
-            'Candidatos': matches_str[:80] if matches_str else '',
-        })
-    st.dataframe(pd.DataFrame(rows_amb), use_container_width=True, hide_index=True)
+    if ambiguous:
+        st.subheader(f'❌ Casos ambiguos ({len(ambiguous)}) — revisar manualmente')
+        rows_amb = []
+        for a in ambiguous:
+            cliente = a.get('cliente', a.get('concepto', ''))
+            monto = a.get('monto', '')
+            monto_str = fmt_monto(monto, es_usd_sim) if isinstance(monto, (int, float)) else str(monto) if monto else ''
+            matches_str = str(a.get('matches', '')) if a.get('matches') else ''
+            rows_amb.append({
+                'Fila': a.get('row', '?'),
+                'Motivo': a.get('motivo', ''),
+                'Cliente / Concepto': str(cliente)[:60] if cliente else '',
+                'Monto': monto_str,
+                'Candidatos': matches_str[:80] if matches_str else '',
+            })
+        st.dataframe(pd.DataFrame(rows_amb), use_container_width=True, hide_index=True)
 
-# ── Confirmar e imputar ───────────────────────────────────────────────────────
+    # ── Confirmar e imputar ───────────────────────────────────────────────────
 
-if not results and not pago_menos:
-    st.info('No hay nada para imputar.')
-    st.stop()
+    if not results and not pago_menos:
+        st.info('No hay nada para imputar.')
+        st.stop()
 
-st.divider()
-st.warning(f'Esto escribirá **{len(results)}** imputaciones y **{len(pago_menos)}** "PAGO MENOS" en los archivos.')
+    st.divider()
+    st.warning(f'Esto escribirá **{len(results)}** imputaciones y **{len(pago_menos)}** "PAGO MENOS" en los archivos.')
 
-if st.button('✅ Confirmar e Imputar', type='primary', use_container_width=True):
-    with st.spinner('Escribiendo archivos...'):
-        try:
+    if st.button('✅ Confirmar e Imputar', type='primary', use_container_width=True):
+        with st.spinner('Escribiendo archivos...'):
             imp_out, deu_out = aplicar(
                 results=sim['results'],
                 pago_menos=sim['pago_menos'],
-                wb_imp=sim['wb_imp'],
-                wb_deu_edit=sim['wb_deu_edit'],
+                imp_bytes=sim['imp_bytes'],
+                deu_bytes=sim['deu_bytes'],
                 imp_sheet=sim['semana'],
                 sheets_cfg=sim['sheets_cfg'],
             )
@@ -263,27 +261,28 @@ if st.button('✅ Confirmar e Imputar', type='primary', use_container_width=True
                 'imp_name': sim['imp_name'],
                 'deu_name': sim['deu_name'],
             }
-        except Exception as e:
-            st.error(f'Error al escribir: {e}')
-            st.stop()
 
-descarga = st.session_state.get('descarga')
-if descarga:
-    st.success('Archivos listos. Descargalos y reemplazá los originales en la carpeta compartida.')
-    col_d1, col_d2 = st.columns(2)
-    with col_d1:
-        st.download_button(
-            '⬇️ Descargar imputaciones.xlsx',
-            data=descarga['imp_out'],
-            file_name=descarga['imp_name'],
-            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            use_container_width=True,
-        )
-    with col_d2:
-        st.download_button(
-            '⬇️ Descargar deudores.xlsx',
-            data=descarga['deu_out'],
-            file_name=descarga['deu_name'],
-            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            use_container_width=True,
-        )
+    descarga = st.session_state.get('descarga')
+    if descarga:
+        st.success('Archivos listos. Descargalos y reemplazá los originales en la carpeta compartida.')
+        col_d1, col_d2 = st.columns(2)
+        with col_d1:
+            st.download_button(
+                '⬇️ Descargar imputaciones.xlsx',
+                data=descarga['imp_out'],
+                file_name=descarga['imp_name'],
+                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                use_container_width=True,
+            )
+        with col_d2:
+            st.download_button(
+                '⬇️ Descargar deudores.xlsx',
+                data=descarga['deu_out'],
+                file_name=descarga['deu_name'],
+                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                use_container_width=True,
+            )
+
+except Exception as e:
+    st.error('Error en la aplicación:')
+    st.code(traceback.format_exc())
