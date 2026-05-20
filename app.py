@@ -1,5 +1,6 @@
 import io
 import os
+import re
 import openpyxl
 import streamlit as st
 import pandas as pd
@@ -25,8 +26,6 @@ def hojas_pesos(sheets):
 
 def hojas_usd(sheets):
     return [s for s in sheets if re.match(r'^USD\s*\d+', s, re.IGNORECASE)]
-
-import re
 
 def parse_cuota_override(texto):
     resultado = {}
