@@ -225,8 +225,7 @@ def procesar(
 ):
     """
     Corre la imputación en modo simulación.
-    Retorna (results, pago_menos, ambiguous, wb_imp, wb_deu_edit, mes_info, sheets_cfg).
-    wb_imp y wb_deu_edit son los workbooks listos para escribir (sin modificar aún).
+    Retorna (results, pago_menos, ambiguous, mes_info, sheets_cfg).
     """
     if tolerance is None:
         tolerance = 5 if es_usd else 3000
@@ -239,8 +238,8 @@ def procesar(
 
     sheets_base = SHEETS_BASE_USD if es_usd else SHEETS_BASE_PESOS
 
+    # Solo data_only para leer — no cargamos el workbook editable acá
     wb_deu_data = openpyxl.load_workbook(io.BytesIO(deu_bytes), data_only=True)
-    wb_deu_edit = openpyxl.load_workbook(io.BytesIO(deu_bytes))
     wb_imp = openpyxl.load_workbook(io.BytesIO(imp_bytes))
 
     sheets_cfg, mes_info = build_sheets_cfg(wb_deu_data, sheets_base)
@@ -418,6 +417,9 @@ def procesar(
             'fecha': fecha_dt,
         })
 
+    wb_deu_data.close()
+    wb_imp.close()
+
     return results, pago_menos, ambiguous, mes_info, sheets_cfg
 
 
@@ -451,4 +453,6 @@ def aplicar(results, pago_menos, imp_bytes, deu_bytes, imp_sheet, sheets_cfg):
     deu_out = io.BytesIO()
     wb_imp.save(imp_out)
     wb_deu_edit.save(deu_out)
+    wb_imp.close()
+    wb_deu_edit.close()
     return imp_out.getvalue(), deu_out.getvalue()
