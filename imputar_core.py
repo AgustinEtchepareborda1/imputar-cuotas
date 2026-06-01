@@ -515,9 +515,15 @@ def aplicar(results, pago_menos, imp_bytes, deu_bytes, imp_sheet, sheets_cfg):
         cfg = sheets_cfg[sname]
         ws_deu = wb_deu_edit[sname]
         cuotas = [r['cuota'] for r in grupo]
-        ws_deu.cell(srow, cfg['real_col']).value = sum(r['monto_real'] for r in grupo)
-        ws_deu.cell(srow, cfg['cuota_col']).value = _format_cuotas(cuotas)
-        ws_deu.cell(srow, cfg['fecha_col']).value = grupo[0]['fecha']
+        for col, val in [
+            (cfg['real_col'],  sum(r['monto_real'] for r in grupo)),
+            (cfg['cuota_col'], _format_cuotas(cuotas)),
+            (cfg['fecha_col'], grupo[0]['fecha']),
+        ]:
+            cell = ws_deu.cell(srow, col)
+            fmt = cell.number_format
+            cell.value = val
+            cell.number_format = fmt
 
     imp_out = io.BytesIO()
     deu_out = io.BytesIO()
