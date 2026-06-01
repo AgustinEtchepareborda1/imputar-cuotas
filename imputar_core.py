@@ -282,7 +282,7 @@ def procesar(
 ):
     """
     Corre la imputación en modo simulación.
-    Retorna (results, pago_menos, ambiguous, mes_info, sheets_cfg).
+    Retorna (results, pago_menos, pago_mas, ambiguous, mes_info, sheets_cfg).
     """
     if tolerance is None:
         tolerance = 5 if es_usd else 3000
@@ -315,10 +315,14 @@ def procesar(
         return buscar_en_deudores_por_nombre(nombre_str, nombre_index)
 
     ws_imp = wb_imp[imp_sheet]
-    results = []
-    ambiguous = []
+    results    = []
+    ambiguous  = []
     pago_menos = []
+    pago_mas   = []
     written_deu_rows = {}  # (sname, srow) -> {'cuit': str, 'last_cuota': int}
+
+    EXCESO_LIMITE   = 50 if es_usd else 50_000   # exceso máximo para imputar normalmente
+    MULTI_TOL_RATIO = 0.05                        # tolerancia proporcional para múltiplos
 
     for row in ws_imp.iter_rows(min_row=4, max_row=max_row):
         fecha_val = row[0].value
@@ -428,6 +432,18 @@ def procesar(
             pago_menos.append({'row': row_num, 'cliente': snombre, 'cuit': cuit_raw, 'transferido': monto_num, 'teorico': round(teo_num, 2 if es_usd else 0), 'diferencia': round(teo_num - monto_num, 2 if es_usd else 0)})
             continue
 
+        # Exceso positivo: verificar si es múltiplo del teórico o excede el límite
+        n_cuotas = 1
+        if teo_num > 0 and monto_num > teo_num + tolerance:
+            exceso = monto_num - teo_num
+            n = round(monto_num / teo_num)
+            multi_tol = max(tolerance, teo_num * MULTI_TOL_RATIO)
+            if n >= 2 and abs(monto_num - n * teo_num) <= multi_tol:
+                n_cuotas = n
+            elif exceso > EXCESO_LIMITE:
+                pago_mas.append({'row': row_num, 'cliente': snombre, 'cuit': cuit_raw, 'transferido': monto_num, 'teorico': round(teo_num, 2 if es_usd else 0), 'diferencia': round(exceso, 2 if es_usd else 0)})
+                continue
+
         ws_d = wb_deu_data[sname]
         cuota_col_val = ws_d.cell(srow, cfg['cuota_col']).value
 
@@ -472,25 +488,27 @@ def procesar(
         else:
             lote_str = ''
 
-        written_deu_rows[deu_key] = {'cuit': cuit_raw, 'last_cuota': next_cuota}
-        results.append({
-            'imp_row': row_num,
-            'cuit': cuit_raw,
-            'cliente': snombre,
-            'lote_str': lote_str,
-            'hoja': sname,
-            'hoja_fila': srow,
-            'monto_real': monto_num,
-            'monto_teo': round(teo_num, 2 if es_usd else 0),
-            'diferencia': round(monto_num - teo_num, 2 if es_usd else 0),
-            'cuota': next_cuota,
-            'fecha': fecha_dt,
-        })
+        written_deu_rows[deu_key] = {'cuit': cuit_raw, 'last_cuota': next_cuota + n_cuotas - 1}
+        monto_por_cuota = round(monto_num / n_cuotas, 2 if es_usd else 0)
+        for i in range(n_cuotas):
+            results.append({
+                'imp_row': row_num,
+                'cuit': cuit_raw,
+                'cliente': snombre,
+                'lote_str': lote_str,
+                'hoja': sname,
+                'hoja_fila': srow,
+                'monto_real': monto_por_cuota,
+                'monto_teo': round(teo_num, 2 if es_usd else 0),
+                'diferencia': round(monto_por_cuota - teo_num, 2 if es_usd else 0),
+                'cuota': next_cuota + i,
+                'fecha': fecha_dt,
+            })
 
     wb_deu_data.close()
     wb_imp.close()
 
-    return results, pago_menos, ambiguous, mes_info, sheets_cfg
+    return results, pago_menos, pago_mas, ambiguous, mes_info, sheets_cfg
 
 
 def _format_cuotas(cuotas):
@@ -501,7 +519,7 @@ def _format_cuotas(cuotas):
     return ', '.join(str(c) for c in cuotas[:-1]) + f' y {cuotas[-1]}'
 
 
-def aplicar(results, pago_menos, imp_bytes, deu_bytes, imp_sheet, sheets_cfg):
+def aplicar(results, pago_menos, imp_bytes, deu_bytes, imp_sheet, sheets_cfg, pago_mas=None):
     """Carga los workbooks desde bytes, escribe y retorna (imp_bytes, deu_bytes)."""
     from collections import defaultdict
     wb_imp = openpyxl.load_workbook(io.BytesIO(imp_bytes))
@@ -512,11 +530,19 @@ def aplicar(results, pago_menos, imp_bytes, deu_bytes, imp_sheet, sheets_cfg):
     for p in pago_menos:
         ws_edit.cell(p['row'], 8).value = 'PAGO MENOS'
 
-    # Imputaciones: una fila por transferencia con su cuota individual
+    for p in (pago_mas or []):
+        ws_edit.cell(p['row'], 8).value = 'PAGO MAS'
+
+    # Imputaciones: agrupar por imp_row (una transferencia puede cubrir N cuotas)
+    imp_groups = defaultdict(list)
     for r in results:
-        row_num = r['imp_row']
-        nombre_corto = str(r['cliente'])[:38]
-        ws_edit.cell(row_num, 8).value = f"{nombre_corto}{r['lote_str']} c{r['cuota']}"
+        imp_groups[r['imp_row']].append(r)
+
+    for row_num, grupo in imp_groups.items():
+        cuotas = [r['cuota'] for r in grupo]
+        nombre_corto = str(grupo[0]['cliente'])[:38]
+        lote_str = grupo[0]['lote_str']
+        ws_edit.cell(row_num, 8).value = f"{nombre_corto}{lote_str} c{_format_cuotas(cuotas)}"
         for cell in ws_edit[row_num]:
             cell.fill = YELLOW_FILL
 

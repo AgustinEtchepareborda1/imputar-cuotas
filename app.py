@@ -136,7 +136,7 @@ try:
         logs = []
 
         with st.spinner('Procesando...'):
-            results, pago_menos, ambiguous, mes_info, sheets_cfg = procesar(
+            results, pago_menos, pago_mas, ambiguous, mes_info, sheets_cfg = procesar(
                 imp_bytes=imp_bytes,
                 deu_bytes=deu_bytes,
                 imp_sheet=semana,
@@ -150,6 +150,7 @@ try:
             st.session_state['sim'] = {
                 'results': results,
                 'pago_menos': pago_menos,
+                'pago_mas': pago_mas,
                 'ambiguous': ambiguous,
                 'mes_info': mes_info,
                 'sheets_cfg': sheets_cfg,
@@ -172,21 +173,23 @@ try:
     if not sim:
         st.stop()
 
-    results = sim['results']
+    results   = sim['results']
     pago_menos = sim['pago_menos']
-    ambiguous = sim['ambiguous']
+    pago_mas   = sim.get('pago_mas', [])
+    ambiguous  = sim['ambiguous']
     es_usd_sim = sim['es_usd']
 
     mes_vals = list(sim['mes_info'].values())
     mes_label = mes_vals[0] if mes_vals else '?'
     st.caption(f'Mes detectado en deudores: **{mes_label}**')
 
-    total = len(results) + len(pago_menos) + len(ambiguous)
-    c1, c2, c3, c4 = st.columns(4)
+    total = len(results) + len(pago_menos) + len(pago_mas) + len(ambiguous)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric('Total filas', total)
     c2.metric('✅ Para imputar', len(results))
     c3.metric('⚠️ Pago menos', len(pago_menos))
-    c4.metric('❌ Ambiguos', len(ambiguous))
+    c4.metric('🔺 Pago más', len(pago_mas))
+    c5.metric('❌ Ambiguos', len(ambiguous))
 
     if results:
         st.subheader(f'✅ Para imputar ({len(results)})')
@@ -219,6 +222,20 @@ try:
             })
         st.dataframe(pd.DataFrame(rows_pm), use_container_width=True, hide_index=True)
 
+    if pago_mas:
+        st.subheader(f'🔺 Pago más ({len(pago_mas)}) — se escribirá "PAGO MAS" en col H')
+        rows_pmas = []
+        for p in pago_mas:
+            rows_pmas.append({
+                'Fila': p['row'],
+                'Cliente': p['cliente'],
+                'CUIT': p['cuit'],
+                'Transferido': fmt_monto(p['transferido'], es_usd_sim),
+                'Teórico': fmt_monto(p['teorico'], es_usd_sim),
+                'Diferencia': fmt_dif(p['diferencia'], es_usd_sim),
+            })
+        st.dataframe(pd.DataFrame(rows_pmas), use_container_width=True, hide_index=True)
+
     if ambiguous:
         st.subheader(f'❌ Casos ambiguos ({len(ambiguous)}) — revisar manualmente')
         rows_amb = []
@@ -250,6 +267,7 @@ try:
             imp_out, deu_out = aplicar(
                 results=sim['results'],
                 pago_menos=sim['pago_menos'],
+                pago_mas=sim.get('pago_mas', []),
                 imp_bytes=sim['imp_bytes'],
                 deu_bytes=sim['deu_bytes'],
                 imp_sheet=sim['semana'],
