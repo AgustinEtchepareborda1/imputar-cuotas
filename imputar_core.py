@@ -243,10 +243,14 @@ def build_previo(wb_imp, imp_sheet, es_usd=False):
                 continue
             cuit = extract_cuit_from_concepto(concepto)
             if cuit and cuit not in cuit_to_nombre_previo:
-                m_cuota = re.search(r'\bc(\d+)\s*$', col_h_str, re.IGNORECASE)
+                # Maneja "c21", "c21,22 y 23", etc.
+                m_cuota = re.search(r'c(\d+(?:[\s,y]+\d+)*)\s*$', col_h_str, re.IGNORECASE)
                 if m_cuota:
-                    cuit_to_cuota_previo[cuit] = int(m_cuota.group(1))
-                nombre_prev = re.sub(r'\s+c\d+\s*$', '', col_h_str, flags=re.IGNORECASE).strip()
+                    nums = re.findall(r'\d+', m_cuota.group(1))
+                    if nums:
+                        cuit_to_cuota_previo[cuit] = max(int(n) for n in nums)
+                nombre_prev = re.sub(r'\s*c\d+(?:[\s,y]+\d+)*\s*$', '', col_h_str, flags=re.IGNORECASE).strip()
+                nombre_prev = re.sub(r'\s*l\d+\s*$', '', nombre_prev, flags=re.IGNORECASE).strip()
                 if nombre_prev:
                     cuit_to_nombre_previo[cuit] = nombre_prev
 
@@ -300,7 +304,7 @@ def procesar(
     results = []
     ambiguous = []
     pago_menos = []
-    written_deu_rows = set()
+    written_deu_rows = {}  # (sname, srow) -> {'cuit': str, 'last_cuota': int}
 
     for row in ws_imp.iter_rows(min_row=4, max_row=max_row):
         fecha_val = row[0].value
@@ -393,8 +397,14 @@ def procesar(
         sname, srow, snombre, teo_val, real_existente = selected
         cfg = sheets_cfg[sname]
 
-        if real_existente is not None or (sname, srow) in written_deu_rows:
-            ambiguous.append({'row': row_num, 'motivo': f'Mes ya imputado ({real_existente}) o destino duplicado en {sname} fila {srow}', 'cliente': snombre, 'cuit': cuit_raw, 'monto': monto_val})
+        if real_existente is not None:
+            ambiguous.append({'row': row_num, 'motivo': f'Mes ya imputado ({real_existente}) en {sname} fila {srow}', 'cliente': snombre, 'cuit': cuit_raw, 'monto': monto_val})
+            continue
+
+        deu_key = (sname, srow)
+        prev_assignment = written_deu_rows.get(deu_key)
+        if prev_assignment is not None and prev_assignment['cuit'] != cuit_raw:
+            ambiguous.append({'row': row_num, 'motivo': f'Destino duplicado (distinto CUIT) en {sname} fila {srow}', 'cliente': snombre, 'cuit': cuit_raw, 'monto': monto_val})
             continue
 
         monto_num = monto_val if isinstance(monto_val, (int, float)) else 0
@@ -407,7 +417,10 @@ def procesar(
         ws_d = wb_deu_data[sname]
         cuota_col_val = ws_d.cell(srow, cfg['cuota_col']).value
 
-        if isinstance(cuota_col_val, str) and 'parte' in cuota_col_val.lower():
+        if prev_assignment is not None:
+            # Mismo cliente, misma fila deudores → cuota siguiente
+            next_cuota = prev_assignment['last_cuota'] + 1
+        elif isinstance(cuota_col_val, str) and 'parte' in cuota_col_val.lower():
             m = re.search(r'\d+', cuota_col_val)
             if m:
                 next_cuota = int(m.group()) + 1
@@ -445,7 +458,7 @@ def procesar(
         else:
             lote_str = ''
 
-        written_deu_rows.add((sname, srow))
+        written_deu_rows[deu_key] = {'cuit': cuit_raw, 'last_cuota': next_cuota}
         results.append({
             'imp_row': row_num,
             'cuit': cuit_raw,
@@ -466,8 +479,17 @@ def procesar(
     return results, pago_menos, ambiguous, mes_info, sheets_cfg
 
 
+def _format_cuotas(cuotas):
+    if len(cuotas) == 1:
+        return cuotas[0]
+    if len(cuotas) == 2:
+        return f'{cuotas[0]} y {cuotas[1]}'
+    return ', '.join(str(c) for c in cuotas[:-1]) + f' y {cuotas[-1]}'
+
+
 def aplicar(results, pago_menos, imp_bytes, deu_bytes, imp_sheet, sheets_cfg):
     """Carga los workbooks desde bytes, escribe y retorna (imp_bytes, deu_bytes)."""
+    from collections import defaultdict
     wb_imp = openpyxl.load_workbook(io.BytesIO(imp_bytes))
     wb_deu_edit = openpyxl.load_workbook(io.BytesIO(deu_bytes))
 
@@ -476,21 +498,26 @@ def aplicar(results, pago_menos, imp_bytes, deu_bytes, imp_sheet, sheets_cfg):
     for p in pago_menos:
         ws_edit.cell(p['row'], 8).value = 'PAGO MENOS'
 
+    # Imputaciones: una fila por transferencia con su cuota individual
     for r in results:
         row_num = r['imp_row']
-        sname = r['hoja']
-        srow = r['hoja_fila']
-        cfg = sheets_cfg[sname]
-        ws_deu = wb_deu_edit[sname]
-
-        ws_deu.cell(srow, cfg['real_col']).value = r['monto_real']
-        ws_deu.cell(srow, cfg['cuota_col']).value = r['cuota']
-        ws_deu.cell(srow, cfg['fecha_col']).value = r['fecha']
-
         nombre_corto = str(r['cliente'])[:38]
         ws_edit.cell(row_num, 8).value = f"{nombre_corto}{r['lote_str']} c{r['cuota']}"
         for cell in ws_edit[row_num]:
             cell.fill = YELLOW_FILL
+
+    # Deudores: agrupar por fila (mismo lote puede tener varias cuotas)
+    deu_groups = defaultdict(list)
+    for r in results:
+        deu_groups[(r['hoja'], r['hoja_fila'])].append(r)
+
+    for (sname, srow), grupo in deu_groups.items():
+        cfg = sheets_cfg[sname]
+        ws_deu = wb_deu_edit[sname]
+        cuotas = [r['cuota'] for r in grupo]
+        ws_deu.cell(srow, cfg['real_col']).value = sum(r['monto_real'] for r in grupo)
+        ws_deu.cell(srow, cfg['cuota_col']).value = _format_cuotas(cuotas)
+        ws_deu.cell(srow, cfg['fecha_col']).value = grupo[0]['fecha']
 
     imp_out = io.BytesIO()
     deu_out = io.BytesIO()
