@@ -173,7 +173,8 @@ def build_indices(wb_deu_data, sheets_cfg):
                 continue
             for palabra in str(nombre).upper().split():
                 if len(palabra) >= 4:
-                    nombre_index.setdefault(palabra, []).append((sheet_name, r, nombre))
+                    # normalizar tildes para que "ÁNGEL" y "ANGEL" sean la misma clave
+                    nombre_index.setdefault(_norm(palabra).upper(), []).append((sheet_name, r, nombre))
 
         cols = []
         for c in range(1, ws_data.max_column + 1):
@@ -188,7 +189,20 @@ def build_indices(wb_deu_data, sheets_cfg):
 
 def buscar_en_deudores_por_nombre(nombre_str, nombre_index):
     from collections import Counter
-    palabras = [p.upper() for p in nombre_str.split() if len(p) >= 4]
+
+    # Si tiene "/" (ej: "Cerda Gabriel / Iboldi Yanina"), buscar cada parte por separado
+    if '/' in nombre_str:
+        resultado, seen = [], set()
+        for parte in nombre_str.split('/'):
+            for item in buscar_en_deudores_por_nombre(parte.strip(), nombre_index):
+                k = (item[0], item[1])
+                if k not in seen:
+                    resultado.append(item)
+                    seen.add(k)
+        return resultado
+
+    # Normalizar tildes en las palabras buscadas (igual que en el índice)
+    palabras = [_norm(p).upper() for p in nombre_str.split() if len(p) >= 4]
     if not palabras:
         return []
     sets = [set((s, r) for s, r, _ in nombre_index.get(p, [])) for p in palabras]
