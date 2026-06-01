@@ -11,6 +11,12 @@ from openpyxl.styles import PatternFill
 
 YELLOW_FILL = PatternFill(patternType='solid', fgColor='FFFF00')
 
+MESES_ES = {
+    1: 'enero', 2: 'febrero', 3: 'marzo', 4: 'abril',
+    5: 'mayo',  6: 'junio',   7: 'julio', 8: 'agosto',
+    9: 'septiembre', 10: 'octubre', 11: 'noviembre', 12: 'diciembre',
+}
+
 SHEETS_BASE_PESOS = {
     'INDICE CAC': {
         'header_row': 5, 'data_start': 6,
@@ -77,18 +83,51 @@ def parse_date(val):
     return None
 
 
-def detectar_columnas_mes(ws, header_row):
-    """Retorna la columna del 'teorico' más a la derecha (= mes más reciente)."""
-    teo_col = None
+def _norm(s):
+    return s.lower().replace('ó', 'o').replace('é', 'e').replace('á', 'a').replace('í', 'i').replace('ú', 'u')
+
+
+def detectar_mes_transferencias(ws_imp, max_row=500):
+    """Lee col A de imputaciones y retorna (year, month) más frecuente, o (None, None)."""
+    from collections import Counter
+    conteo = Counter()
+    for row in ws_imp.iter_rows(min_row=4, max_row=max_row, max_col=1):
+        dt = parse_date(row[0].value)
+        if dt:
+            conteo[(dt.year, dt.month)] += 1
+    if not conteo:
+        return None, None
+    (year, month), _ = conteo.most_common(1)[0]
+    return year, month
+
+
+def detectar_columnas_mes(ws, header_row, year=None, month=None):
+    """
+    Retorna la columna 'teorico' para el mes/año indicado.
+    Si year/month son None o no hay match, retorna la más a la derecha (fallback).
+    """
+    mes_nombre = _norm(MESES_ES.get(month, '')) if month else None
+    yr_str = str(year % 100) if year else None       # "26" para 2026
+    yr_full = str(year) if year else None             # "2026"
+
+    teo_col_match = None
+    teo_col_fallback = None
     for c in range(1, ws.max_column + 1):
         h = ws.cell(header_row, c).value
-        if h and ('teorico' in str(h).lower() or 'teórico' in str(h).lower()):
-            teo_col = c
-    return teo_col
+        if not h:
+            continue
+        h_norm = _norm(str(h))
+        if 'teorico' not in h_norm:
+            continue
+        teo_col_fallback = c
+        if mes_nombre and yr_str and mes_nombre in h_norm:
+            if yr_str in h_norm or (yr_full and yr_full in h_norm):
+                teo_col_match = c
+    return teo_col_match if teo_col_match is not None else teo_col_fallback
 
 
-def build_sheets_cfg(wb_deu_data, sheets_base):
-    """Auto-detecta columnas del mes actual y construye sheets_cfg completo."""
+def build_sheets_cfg(wb_deu_data, sheets_base, year=None, month=None):
+    """Auto-detecta columnas del mes y construye sheets_cfg completo."""
     sheets_cfg = {}
     mes_info = {}
     for sheet_name, base in sheets_base.items():
@@ -96,7 +135,7 @@ def build_sheets_cfg(wb_deu_data, sheets_base):
             ws = wb_deu_data[sheet_name]
         except KeyError:
             continue
-        teo_col = detectar_columnas_mes(ws, base['header_row'])
+        teo_col = detectar_columnas_mes(ws, base['header_row'], year=year, month=month)
         if teo_col is None:
             continue
         cfg = dict(base)
@@ -242,7 +281,11 @@ def procesar(
     wb_deu_data = openpyxl.load_workbook(io.BytesIO(deu_bytes), data_only=True)
     wb_imp = openpyxl.load_workbook(io.BytesIO(imp_bytes))
 
-    sheets_cfg, mes_info = build_sheets_cfg(wb_deu_data, sheets_base)
+    tx_year, tx_month = detectar_mes_transferencias(wb_imp[imp_sheet], max_row)
+    if tx_year:
+        log_fn(f'Mes detectado en transferencias: {MESES_ES.get(tx_month, "?")} {tx_year}')
+
+    sheets_cfg, mes_info = build_sheets_cfg(wb_deu_data, sheets_base, year=tx_year, month=tx_month)
     cuit_index, nombre_index, cuota_history_cols = build_indices(wb_deu_data, sheets_cfg)
     log_fn(f'{len(cuit_index)} CUITs indexados en deudores')
 
