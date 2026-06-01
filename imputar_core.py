@@ -282,7 +282,7 @@ def procesar(
 ):
     """
     Corre la imputación en modo simulación.
-    Retorna (results, pago_menos, pago_mas, ambiguous, mes_info, sheets_cfg).
+    Retorna (results, pago_menos, pago_mas, ambiguous, sin_fila, mes_info, sheets_cfg).
     """
     if tolerance is None:
         tolerance = 5 if es_usd else 3000
@@ -319,6 +319,7 @@ def procesar(
     ambiguous  = []
     pago_menos = []
     pago_mas   = []
+    sin_fila   = []  # nombre conocido pero sin fila en deudores → prellena col H sin amarillo
     written_deu_rows = {}  # (sname, srow) -> {'cuit': str, 'last_cuota': int}
 
     EXCESO_LIMITE   = 50 if es_usd else 50_000   # exceso máximo para imputar normalmente
@@ -358,6 +359,7 @@ def procesar(
                     ambiguous.append({'row': row_num, 'motivo': f'CUIT {cuit_raw} no en deudores; nombre "{nombre_previo}" da {len(m2)} candidatos', 'concepto': str(concepto)[:60], 'monto': monto_val, 'fecha': fecha_val, 'matches': [(n, None) for _, _, n in m2]})
                     continue
                 else:
+                    sin_fila.append({'imp_row': row_num, 'nombre': nombre_previo})
                     ambiguous.append({'row': row_num, 'motivo': f'CUIT {cuit_raw} no en deudores; "{nombre_previo}" no encontrado en deudores', 'concepto': str(concepto)[:60], 'monto': monto_val, 'fecha': fecha_val})
                     continue
             else:
@@ -371,6 +373,7 @@ def procesar(
                         ambiguous.append({'row': row_num, 'motivo': f'CUIT {cuit_raw} en comprobantes como "{nombre_comp}"; da {len(m2)} candidatos', 'concepto': str(concepto)[:60], 'monto': monto_val, 'fecha': fecha_val, 'matches': [(n, None) for _, _, n in m2]})
                         continue
                     else:
+                        sin_fila.append({'imp_row': row_num, 'nombre': nombre_comp})
                         ambiguous.append({'row': row_num, 'motivo': f'CUIT {cuit_raw} en comprobantes como "{nombre_comp}"; no encontrado en deudores', 'concepto': str(concepto)[:60], 'monto': monto_val, 'fecha': fecha_val})
                         continue
                 else:
@@ -508,7 +511,7 @@ def procesar(
     wb_deu_data.close()
     wb_imp.close()
 
-    return results, pago_menos, pago_mas, ambiguous, mes_info, sheets_cfg
+    return results, pago_menos, pago_mas, ambiguous, sin_fila, mes_info, sheets_cfg
 
 
 def _format_cuotas(cuotas):
@@ -519,7 +522,7 @@ def _format_cuotas(cuotas):
     return ', '.join(str(c) for c in cuotas[:-1]) + f' y {cuotas[-1]}'
 
 
-def aplicar(results, pago_menos, imp_bytes, deu_bytes, imp_sheet, sheets_cfg, pago_mas=None):
+def aplicar(results, pago_menos, imp_bytes, deu_bytes, imp_sheet, sheets_cfg, pago_mas=None, sin_fila=None):
     """Carga los workbooks desde bytes, escribe y retorna (imp_bytes, deu_bytes)."""
     from collections import defaultdict
     wb_imp = openpyxl.load_workbook(io.BytesIO(imp_bytes))
@@ -532,6 +535,12 @@ def aplicar(results, pago_menos, imp_bytes, deu_bytes, imp_sheet, sheets_cfg, pa
 
     for p in (pago_mas or []):
         ws_edit.cell(p['row'], 8).value = 'PAGO MAS'
+
+    # Prellenar nombre en col H sin amarillo (nombre conocido, fila en deudores no encontrada)
+    for s in (sin_fila or []):
+        cell = ws_edit.cell(s['imp_row'], 8)
+        if not cell.value:  # no pisar si ya tiene algo
+            cell.value = s['nombre']
 
     # Imputaciones: agrupar por imp_row (una transferencia puede cubrir N cuotas)
     imp_groups = defaultdict(list)

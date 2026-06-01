@@ -136,7 +136,7 @@ try:
         logs = []
 
         with st.spinner('Procesando...'):
-            results, pago_menos, pago_mas, ambiguous, mes_info, sheets_cfg = procesar(
+            results, pago_menos, pago_mas, ambiguous, sin_fila, mes_info, sheets_cfg = procesar(
                 imp_bytes=imp_bytes,
                 deu_bytes=deu_bytes,
                 imp_sheet=semana,
@@ -152,6 +152,7 @@ try:
                 'pago_menos': pago_menos,
                 'pago_mas': pago_mas,
                 'ambiguous': ambiguous,
+                'sin_fila': sin_fila,
                 'mes_info': mes_info,
                 'sheets_cfg': sheets_cfg,
                 'semana': semana,
@@ -268,6 +269,7 @@ try:
                 results=sim['results'],
                 pago_menos=sim['pago_menos'],
                 pago_mas=sim.get('pago_mas', []),
+                sin_fila=sim.get('sin_fila', []),
                 imp_bytes=sim['imp_bytes'],
                 deu_bytes=sim['deu_bytes'],
                 imp_sheet=sim['semana'],
