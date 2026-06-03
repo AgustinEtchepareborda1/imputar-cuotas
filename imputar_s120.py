@@ -17,11 +17,10 @@ DRY_RUN = True   # ← cambiar a False para escribir realmente
 
 IMP_FILE  = r'datos/IMPUTACIONES -20.05.26.xlsx'
 DEU_FILE  = r'datos/DEUDORES FINK 20-05-2026.xlsx'
-IMP_SHEET = 'S 120'
-REF_SHEET = 'S 119'   # solo para referencia visual, no se toca
+IMP_SHEET = None   # None = auto-detectar última hoja 'S NNN' sin procesar
 
 TOLERANCE = 3000       # diferencia máxima aceptable en pesos
-MAX_ROW   = 36         # procesar solo hasta esta fila de imputaciones
+MAX_ROW   = None       # None = procesar hasta el final de la hoja
 
 # Overrides manuales de cuota cuando max_cuota=None y el número correcto se conoce
 # Formato: 'CUIT': cuota_a_imputar
@@ -41,21 +40,14 @@ SHEETS_CFG = {
         'cuit_col': 12,   # L  DNI o CUIT
         'nombre_col': 9,  # I  Nombre y Apellido
         'lote_col':  8,   # H  LOTE
-        'teo_col':  136,  # EF pago MAYO 26 teorico
-        'real_col': 137,  # EG pago MAYO 26 real
-        'cuota_col':138,  # EH NUMERO DE CUOTA
-        'fecha_col':139,  # EI fecha depo
         'max_cuota_col':1,# A  MAYOR CUOTA (fórmula)
+        # teo_col / real_col / cuota_col / fecha_col → auto-detectados por mes
     },
     'INDICE CAC M. OBRA': {
         'header_row': 3, 'data_start': 4,
         'cuit_col': 11,   # K  DNI o CUIT
         'nombre_col': 9,  # I  Nombre y Apellido
         'lote_col':  8,   # H  LOTE
-        'teo_col':  132,  # EB pago MAYO 26 teorico
-        'real_col': 133,  # EC pago MAYO 26 real
-        'cuota_col':134,  # ED NUMERO DE CUOTA
-        'fecha_col':135,  # EE fecha depo
         'max_cuota_col':1,
     },
     'BOLSA CEMENTO': {
@@ -63,15 +55,47 @@ SHEETS_CFG = {
         'cuit_col': 14,   # N  DNI o CUIT
         'nombre_col': 10, # J  Nombre y Apellido
         'lote_col':  9,   # I  LOTE
-        'teo_col':  135,  # EE pago MAYO 26 teorico
-        'real_col': 136,  # EF pago MAYO 26 real
-        'cuota_col':137,  # EG NUMERO DE CUOTA
-        'fecha_col':138,  # EH fecha depo
         'max_cuota_col':1,
     },
 }
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
+MESES_ES = {
+    1: 'enero', 2: 'febrero', 3: 'marzo', 4: 'abril',
+    5: 'mayo',  6: 'junio',   7: 'julio', 8: 'agosto',
+    9: 'septiembre', 10: 'octubre', 11: 'noviembre', 12: 'diciembre',
+}
+
+
+def detectar_columnas_mes(wb_deu, sheets_cfg, mes, anio):
+    """Busca en cada hoja las columnas del mes/año dado y actualiza sheets_cfg."""
+    mes_str   = MESES_ES[mes]
+    anio_short = str(anio)[-2:]
+    for sheet_name, cfg in sheets_cfg.items():
+        ws = wb_deu[sheet_name]
+        hrow = cfg['header_row']
+        teo_col = None
+        for c in range(1, ws.max_column + 1):
+            h = ws.cell(hrow, c).value
+            if not h:
+                continue
+            h_lower = str(h).lower()
+            if mes_str in h_lower and anio_short in h_lower and 'teorico' in h_lower:
+                teo_col = c
+                break
+        if teo_col is None:
+            raise ValueError(
+                f"No se encontró '{mes_str} {anio_short} teorico' en '{sheet_name}' "
+                f"(fila {hrow}). ¿El archivo de deudores tiene ese mes?"
+            )
+        cfg['teo_col']   = teo_col
+        cfg['real_col']  = teo_col + 1
+        cfg['cuota_col'] = teo_col + 2
+        cfg['fecha_col'] = teo_col + 3
+        col_letra = ws.cell(hrow, teo_col).column_letter
+        print(f'  -> {sheet_name}: col {col_letra} = {mes_str} {anio_short} teorico')
+
 
 def normalize_str(s):
     """Convierte a mayúsculas y quita tildes/diacríticos para comparación."""
@@ -129,10 +153,39 @@ def parse_date(val):
     return None
 
 
+# ── 0. Auto-detectar hoja S y mes de imputación ─────────────────────────────
+from collections import Counter as _Counter
+
+_wb_pre = openpyxl.load_workbook(IMP_FILE, read_only=True)
+_all_sheets = _wb_pre.sheetnames
+
+if IMP_SHEET is None:
+    hojas_s = [s for s in _all_sheets if re.match(r'^S\s+\d+$', s, re.IGNORECASE)]
+    if not hojas_s:
+        raise ValueError('No se encontraron hojas "S NNN" en el archivo de imputaciones.')
+    IMP_SHEET = hojas_s[-1]
+    print(f'Hoja auto-detectada: {IMP_SHEET}')
+else:
+    print(f'Hoja: {IMP_SHEET}')
+
+_ws_pre = _wb_pre[IMP_SHEET]
+_fechas = [parse_date(r[0]) for r in _ws_pre.iter_rows(min_row=4, values_only=True) if r[0]]
+_fechas = [f for f in _fechas if f]
+_wb_pre.close()
+
+if not _fechas:
+    raise ValueError(f'No se encontraron fechas válidas en la hoja {IMP_SHEET}.')
+
+_mes_imp, _anio_imp = _Counter((f.month, f.year) for f in _fechas).most_common(1)[0][0]
+print(f'Mes detectado: {MESES_ES[_mes_imp].upper()} {_anio_imp}')
+
 # ── 1. Cargar deudores (dos veces: una para valores, otra para escritura) ──
 print('Cargando deudores...')
 wb_deu_data = openpyxl.load_workbook(DEU_FILE, data_only=True)   # leer valores
 wb_deu_edit = openpyxl.load_workbook(DEU_FILE)                    # para escritura
+
+print('Detectando columnas del mes en deudores...')
+detectar_columnas_mes(wb_deu_data, SHEETS_CFG, _mes_imp, _anio_imp)
 
 # ── 2. Construir índice CUIT → (sheet, row, nombre, ws_edit) ─────────────
 cuit_index = {}   # normalized_cuit_str -> list of (sheet_name, row, nombre)

@@ -33,24 +33,22 @@ Si no se corre el exportar, igual funciona con el último cache guardado en `dat
 
 ## Cómo correr la imputación de una nueva semana (pesos)
 
-1. **Cambiar las variables en `imputar_s120.py`** (primeras líneas de CONFIG):
-   - `IMP_SHEET = 'S 121'` → nombre de la hoja a procesar (ya configurado)
-   - `DRY_RUN = True` → siempre empezar en True para revisar (ya configurado)
+El script **auto-detecta** la hoja (última "S NNN" del archivo) y las columnas del mes (busca "MES AÑO teorico" en los headers de deudores). No hace falta tocar nada al cambiar de semana o de mes.
 
-2. **Verificar las columnas de mes en `SHEETS_CFG`** si cambió el mes:
-   - Cada mes nuevo agrega 4 columnas a la derecha en deudores
-   - Buscar los headers `pago MES AÑO teorico/real/NUMERO DE CUOTA/fecha depo`
-   - Actualmente configurado para **Mayo 2026**
+1. **Solo revisar `DRY_RUN = True`** en `imputar_s120.py` (ya está así por defecto)
+2. **Correr dry-run**: `python imputar_s120.py`
+3. **Revisar el reporte**, especialmente los casos ambiguos
+4. **Cambiar `DRY_RUN = False`** y volver a correr para escribir
 
-3. **Correr dry-run**: `python imputar_s120.py`
-4. **Revisar el reporte**, especialmente los casos ambiguos
-5. **Cambiar `DRY_RUN = False`** y volver a correr para escribir
+Si necesitás procesar una hoja específica (no la última), setear `IMP_SHEET = 'S 123'` manualmente.
 
 ## Cómo correr la imputación USD
 
-1. Usar `imputar_usd5.py` (ya configurado para "USD 5", DRY_RUN=True)
-2. Para la siguiente semana USD, cambiar `IMP_SHEET = 'USD 6'` (etc.)
-3. Mismo flujo que pesos: dry-run → revisar → DRY_RUN=False
+Igual que pesos — auto-detecta la última hoja "USD N" y el mes:
+
+1. `DRY_RUN = True` en `imputar_usd5.py`
+2. `python imputar_usd5.py`
+3. Revisar → `DRY_RUN = False` → volver a correr
 
 ## Estructura de deudores.xlsx
 
@@ -62,19 +60,9 @@ Hojas con cuotas en pesos (NO escribir en '$ USD fijo' desde el script pesos):
 | INDICE CAC M. OBRA | fila 3 | fila 4 | K (11) | I (9) |
 | BOLSA CEMENTO | fila 3 | fila 4 | N (14) | J (10) |
 
-**Columnas de Mayo 2026** (actualizar cuando cambia el mes):
+**Columnas de pago**: auto-detectadas por el script buscando "MES AÑO teorico" en los headers. Las 4 columnas (teorico, real, N° cuota, fecha) son siempre consecutivas a partir de ahí.
 
-| Hoja | Teorico | Real | N° Cuota | Fecha |
-|------|---------|------|----------|-------|
-| INDICE CAC | EF (136) | EG (137) | EH (138) | EI (139) |
-| INDICE CAC M. OBRA | EB (132) | EC (133) | ED (134) | EE (135) |
-| BOLSA CEMENTO | EE (135) | EF (136) | EG (137) | EH (138) |
-
-Hoja USD (`$  USD fijo`, dos espacios), Mayo 2026:
-
-| Header row | Data desde | CUIT col | Nombre col | Lote col | Teorico | Real | N° Cuota | Fecha |
-|-----------|------------|----------|-----------|---------|---------|------|----------|-------|
-| fila 3 | fila 4 | M (13) | J (10) | I (9) | col 131 | col 132 | col 133 | col 134 |
+Hoja USD (`$  USD fijo`, dos espacios): misma estructura, header en fila 3.
 
 CUITs en USD fijo pueden tener formato con guiones (`20-34658691-6`) o múltiples separados por `/`. El script los normaliza automáticamente.
 
@@ -125,30 +113,6 @@ Cada hoja semanal ("S 121", "USD 5", etc.) tiene:
 - Si ya fue imputado este mes → reportar como ambiguo (no sobreescribir)
 - Al imputar: escribir en col H `{nombre} [l{lote}] c{cuota}`, en col I `x`, pintar fila amarilla
 
-## Para cambiar de mes (ej: Junio 2026)
+## Para cambiar de mes
 
-Buscar los headers exactos en deudores fila 5 (INDICE CAC) o fila 3 (otras hojas):
-```python
-python -c "
-import openpyxl
-wb = openpyxl.load_workbook('datos/DEUDORES FINK-4-2026.xlsx', data_only=True)
-ws = wb['INDICE CAC']
-for c in range(1, ws.max_column+1):
-    v = ws.cell(5, c).value
-    if v and 'junio' in str(v).lower() and '26' in str(v):
-        print(c, ws.cell(5,c).column_letter, v)
-"
-```
-
-Para USD fijo (header en fila 3):
-```python
-python -c "
-import openpyxl
-wb = openpyxl.load_workbook('datos/DEUDORES FINK-4-2026.xlsx', data_only=True)
-ws = wb['\$  USD fijo']
-for c in range(1, ws.max_column+1):
-    v = ws.cell(3, c).value
-    if v and 'junio' in str(v).lower() and '26' in str(v):
-        print(c, v)
-"
-```
+No hace falta hacer nada — el script detecta el mes a partir de las fechas de las transferencias y busca la columna correspondiente en deudores automáticamente. Si el archivo de deudores no tiene ese mes aún, el script lanza un error explicativo.
