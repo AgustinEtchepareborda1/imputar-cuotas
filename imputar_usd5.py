@@ -6,6 +6,7 @@ Run with DRY_RUN=True first to review before writing.
 import openpyxl
 from openpyxl.styles import PatternFill
 import re
+import unicodedata
 import datetime
 import shutil
 import os
@@ -47,6 +48,12 @@ SHEETS_CFG = {
 }
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
+def normalize_str(s):
+    """Convierte a mayúsculas y quita tildes/diacríticos para comparación."""
+    s = str(s).upper()
+    return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
+
 
 def normalize_cuits(raw):
     """Devuelve lista de strings de dígitos extraídos del campo CUIT."""
@@ -141,7 +148,7 @@ for sheet_name, cfg in SHEETS_CFG.items():
         nombre = ws_data.cell(r, cfg['nombre_col']).value
         if not nombre:
             continue
-        for palabra in str(nombre).upper().split():
+        for palabra in normalize_str(str(nombre)).split():
             if len(palabra) >= 4:
                 nombre_index.setdefault(palabra, []).append((sheet_name, r, nombre))
 
@@ -174,10 +181,16 @@ for hoja in hojas_previas[:6]:
             continue
         cuit = extract_cuit_from_concepto(concepto)
         if cuit and cuit not in cuit_to_nombre_previo:
-            m_cuota = re.search(r'\bc(\d+)\s*$', col_h_str, re.IGNORECASE)
+            # Buscar cuota en cualquier posición (acepta "c 11" con espacio)
+            m_cuota = re.search(r'\bc\s*(\d+)', col_h_str, re.IGNORECASE)
             if m_cuota:
                 cuit_to_cuota_previo[cuit] = int(m_cuota.group(1))
-            nombre_prev = re.sub(r'\s+c\d+\s*$', '', col_h_str, flags=re.IGNORECASE).strip()
+            # Limpiar nombre: quitar cuota y todo lo que venga después
+            nombre_prev = re.sub(r'\s+c\s*\d+.*$', '', col_h_str, flags=re.IGNORECASE).strip()
+            # Quitar "parte de ..." si quedó
+            nombre_prev = re.sub(r'\s+parte\s+de.*$', '', nombre_prev, flags=re.IGNORECASE).strip()
+            # Si hay "y" (dos personas), usar solo la primera
+            nombre_prev = re.split(r'\s+y\s+', nombre_prev, maxsplit=1, flags=re.IGNORECASE)[0].strip()
             if nombre_prev:
                 cuit_to_nombre_previo[cuit] = nombre_prev
 
@@ -190,7 +203,9 @@ print(f'  -> {len(cuit_to_nombre_comprobantes)} CUITs en cache de comprobantes')
 
 def buscar_en_deudores_por_nombre(nombre_str):
     """Busca en deudores por palabras del nombre. Devuelve lista de (sheet, row, nombre)."""
-    palabras = [p.upper() for p in nombre_str.split() if len(p) >= 4]
+    # Si hay "y" (nombres compuestos), usar solo la primera parte
+    nombre_str = re.split(r'\s+y\s+', nombre_str, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+    palabras = [p for p in normalize_str(nombre_str).split() if len(p) >= 4]
     if not palabras:
         return []
     sets = [set((s, r) for s, r, _ in nombre_index.get(p, [])) for p in palabras]
