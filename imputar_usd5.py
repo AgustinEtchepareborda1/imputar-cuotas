@@ -210,8 +210,9 @@ for sheet_name, cfg in SHEETS_CFG.items():
         if not nombre:
             continue
         for palabra in normalize_str(str(nombre)).split():
-            if len(palabra) >= 4:
-                nombre_index.setdefault(palabra, []).append((sheet_name, r, nombre))
+            p_clean = re.sub(r'[^A-Z0-9]', '', palabra)
+            if len(p_clean) >= 4:
+                nombre_index.setdefault(p_clean, []).append((sheet_name, r, nombre))
 
 # ── 2c. Índice CUIT → nombre desde hojas anteriores de imputaciones ──────────
 # Solo considera hojas USD anteriores (USD 4, USD 3, USD 2, USD)
@@ -264,17 +265,17 @@ print(f'  -> {len(cuit_to_nombre_comprobantes)} CUITs en cache de comprobantes')
 
 def buscar_en_deudores_por_nombre(nombre_str):
     """Busca en deudores por palabras del nombre. Devuelve lista de (sheet, row, nombre)."""
-    # Si hay "y" (nombres compuestos), usar solo la primera parte
     nombre_str = re.split(r'\s+y\s+', nombre_str, maxsplit=1, flags=re.IGNORECASE)[0].strip()
-    palabras = [p for p in normalize_str(nombre_str).split() if len(p) >= 4]
+    palabras = [re.sub(r'[^A-Z0-9]', '', p) for p in normalize_str(nombre_str).split()]
+    palabras = [p for p in palabras if len(p) >= 4]
     if not palabras:
         return []
+
     sets = [set((s, r) for s, r, _ in nombre_index.get(p, [])) for p in palabras]
-    if not sets:
-        return []
     comunes = sets[0]
     for s in sets[1:]:
         comunes &= s
+
     if not comunes:
         from collections import Counter
         cnt = Counter()
@@ -283,6 +284,17 @@ def buscar_en_deudores_por_nombre(nombre_str):
                 cnt[(s, r)] += 1
         max_hits = max(cnt.values()) if cnt else 0
         comunes = {k for k, v in cnt.items() if v == max_hits and v >= max(2, len(palabras) - 1)}
+
+    if not comunes:
+        for p in sorted(palabras, key=len, reverse=True):
+            candidatos = set((s, r) for s, r, _ in nombre_index.get(p, []))
+            if len(candidatos) == 1:
+                (s_c, r_c) = next(iter(candidatos))
+                otras = [q for q in palabras if q != p]
+                if any((s_c, r_c) in {(s2, r2) for s2, r2, _ in nombre_index.get(q, [])} for q in otras):
+                    comunes = candidatos
+                    break
+
     resultado = []
     seen = set()
     for p in palabras:
@@ -337,19 +349,10 @@ for row in ws_imp.iter_rows(min_row=4, max_row=MAX_ROW):
         nombre_previo = cuit_to_nombre_previo.get(cuit_raw)
         if nombre_previo:
             matches_nombre = buscar_en_deudores_por_nombre(nombre_previo)
-            if len(matches_nombre) == 1:
+            if matches_nombre:
                 matches = matches_nombre
-                print(f'    [fallback nombre] Fila {row_num}: CUIT {cuit_raw} -> "{nombre_previo}" -> {matches[0][2]}')
-            elif len(matches_nombre) > 1:
-                ambiguous.append({
-                    'row': row_num,
-                    'motivo': f'CUIT {cuit_raw} no en deudores; nombre "{nombre_previo}" da {len(matches_nombre)} candidatos',
-                    'concepto': concepto,
-                    'monto': monto_val,
-                    'fecha': fecha_val,
-                    'matches': [(n, None) for _, _, n in matches_nombre],
-                })
-                continue
+                tag = 'fallback nombre' if len(matches) == 1 else f'fallback nombre ({len(matches)} candidatos, desambiguando)'
+                print(f'    [{tag}] Fila {row_num}: CUIT {cuit_raw} -> "{nombre_previo}" -> {matches[0][2]}')
             else:
                 ambiguous.append({
                     'row': row_num,
@@ -364,19 +367,10 @@ for row in ws_imp.iter_rows(min_row=4, max_row=MAX_ROW):
             nombre_comprobante = cuit_to_nombre_comprobantes.get(cuit_raw)
             if nombre_comprobante:
                 matches_nombre = buscar_en_deudores_por_nombre(nombre_comprobante)
-                if len(matches_nombre) == 1:
+                if matches_nombre:
                     matches = matches_nombre
-                    print(f'    [fallback comprobantes] Fila {row_num}: CUIT {cuit_raw} -> "{nombre_comprobante}" -> {matches[0][2]}')
-                elif len(matches_nombre) > 1:
-                    ambiguous.append({
-                        'row': row_num,
-                        'motivo': f'CUIT {cuit_raw} en comprobantes como "{nombre_comprobante}"; da {len(matches_nombre)} candidatos en deudores',
-                        'concepto': concepto,
-                        'monto': monto_val,
-                        'fecha': fecha_val,
-                        'matches': [(n, None) for _, _, n in matches_nombre],
-                    })
-                    continue
+                    tag = 'fallback comprobantes' if len(matches) == 1 else f'fallback comprobantes ({len(matches)} candidatos, desambiguando)'
+                    print(f'    [{tag}] Fila {row_num}: CUIT {cuit_raw} -> "{nombre_comprobante}" -> {matches[0][2]}')
                 else:
                     ambiguous.append({
                         'row': row_num,
