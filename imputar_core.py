@@ -87,6 +87,31 @@ def _norm(s):
     return s.lower().replace('ó', 'o').replace('é', 'e').replace('á', 'a').replace('í', 'i').replace('ú', 'u')
 
 
+def max_cuota_celda(val):
+    """Máxima cuota implicada por una celda de "NUMERO DE CUOTA".
+
+    Acepta números, listas tipo "10 y 11" / "2 Y 3" / "3, 4 y 5" (el formato que
+    escribe el propio bot al imputar varias cuotas juntas) y "parte de cX"
+    (la cuota X está parcialmente paga → el siguiente pago completo es X+1).
+    Otros textos ("1 al 12 inclusive", etc.) se ignoran por ambiguos.
+    """
+    if isinstance(val, (int, float)):
+        n = int(val)
+        return n if 0 < n <= 200 else None
+    if isinstance(val, str):
+        s = val.strip()
+        if 'parte' in s.lower():
+            m = re.search(r'\d+', s)
+            nums = [int(m.group())] if m else []
+        elif re.fullmatch(r'[cC]?\s*\d+(\s*[,yY]\s*[cC]?\s*\d+)*\.?', s):
+            nums = [int(x) for x in re.findall(r'\d+', s)]
+        else:
+            return None
+        nums = [n for n in nums if 0 < n <= 200]
+        return max(nums) if nums else None
+    return None
+
+
 def detectar_mes_transferencias(ws_imp, max_row=500):
     """Lee col A de imputaciones y retorna (year, month) más frecuente, o (None, None)."""
     from collections import Counter
@@ -402,20 +427,22 @@ def procesar(
                     if not disponibles:
                         ambiguous.append({'row': row_num, 'motivo': 'Todos los lotes ya asignados en este run', 'cuit': cuit_raw, 'monto': monto_val, 'matches': [(n, t) for _, _, n, t, _ in sin_imputar]})
                         continue
-                    selected = sorted(disponibles, key=lambda x: (x[0], x[1]))[0]
+                    # Lotes empatados: si la transferencia cubre varias cuotas,
+                    # se reparten entre estos lotes (una por lote) más abajo
+                    targets = sorted(disponibles, key=lambda x: (x[0], x[1]))
                 else:
-                    selected = mejor
+                    targets = [mejor]
             else:
-                selected = sin_imputar[0]
+                targets = [sin_imputar[0]]
         else:
             sname, srow, snombre = matches[0]
             cfg = sheets_cfg[sname]
             ws_d = wb_deu_data[sname]
             teo = ws_d.cell(srow, cfg['teo_col']).value
             real = ws_d.cell(srow, cfg['real_col']).value
-            selected = (sname, srow, snombre, teo, real)
+            targets = [(sname, srow, snombre, teo, real)]
 
-        sname, srow, snombre, teo_val, real_existente = selected
+        sname, srow, snombre, teo_val, real_existente = targets[0]
         cfg = sheets_cfg[sname]
 
         if real_existente is not None:
@@ -447,66 +474,88 @@ def procesar(
                 pago_mas.append({'row': row_num, 'cliente': snombre, 'cuit': cuit_raw, 'transferido': monto_num, 'teorico': round(teo_num, 2 if es_usd else 0), 'diferencia': round(exceso, 2 if es_usd else 0)})
                 continue
 
-        ws_d = wb_deu_data[sname]
-        cuota_col_val = ws_d.cell(srow, cfg['cuota_col']).value
-
-        if prev_assignment is not None:
-            # Mismo cliente, misma fila deudores → cuota siguiente
-            next_cuota = prev_assignment['last_cuota'] + 1
-        elif isinstance(cuota_col_val, str) and 'parte' in cuota_col_val.lower():
-            m = re.search(r'\d+', cuota_col_val)
-            if m:
-                next_cuota = int(m.group()) + 1
-            else:
-                ambiguous.append({'row': row_num, 'motivo': f'Cuota dice "parte de..." pero no se pudo extraer número ({cuota_col_val!r})', 'cliente': snombre, 'cuit': cuit_raw, 'hoja': sname, 'hoja_fila': srow})
-                continue
+        # Si la transferencia cubre N cuotas y hay varios lotes empatados
+        # disponibles, repartir las cuotas entre los lotes (una por lote)
+        if n_cuotas > 1 and len(targets) > 1:
+            usar = targets[:min(n_cuotas, len(targets))]
         else:
-            hist_cols = cuota_history_cols.get(sname, [])
-            max_hist = None
-            for hc in hist_cols:
-                val = ws_d.cell(srow, hc).value
-                if isinstance(val, (int, float)) and 0 < val <= 200:
-                    if max_hist is None or val > max_hist:
-                        max_hist = int(val)
+            usar = [targets[0]]
+        base, resto = divmod(n_cuotas, len(usar))
+        counts = [base + (1 if i < resto else 0) for i in range(len(usar))]
 
-            if max_hist is not None:
-                next_cuota = max_hist + 1
-            elif cuit_raw in cuit_to_cuota_previo:
-                next_cuota = cuit_to_cuota_previo[cuit_raw] + 1
-                log_fn(f'Fila {row_num}: cuota previa {cuit_to_cuota_previo[cuit_raw]}+1={next_cuota}')
-            elif cuit_raw in cuota_override:
-                next_cuota = cuota_override[cuit_raw]
-                log_fn(f'Fila {row_num}: cuota override {next_cuota} para {snombre}')
+        # Determinar la cuota de cada fila destino sin tocar estado, para poder
+        # abortar limpio si alguna falla
+        planes = []
+        error_motivo = None
+        for (p_sname, p_srow, p_snombre, p_teo, _p_real), cnt in zip(usar, counts):
+            p_cfg = sheets_cfg[p_sname]
+            prev = written_deu_rows.get((p_sname, p_srow))
+            cuota_col_val = wb_deu_data[p_sname].cell(p_srow, p_cfg['cuota_col']).value
+
+            if prev is not None:
+                # Mismo cliente, misma fila deudores → cuota siguiente
+                next_cuota = prev['last_cuota'] + 1
+            elif isinstance(cuota_col_val, str) and 'parte' in cuota_col_val.lower():
+                m = re.search(r'\d+', cuota_col_val)
+                if m:
+                    next_cuota = int(m.group()) + 1
+                else:
+                    error_motivo = f'Cuota dice "parte de..." pero no se pudo extraer número ({cuota_col_val!r})'
+                    break
             else:
-                ambiguous.append({'row': row_num, 'motivo': 'No se pudo determinar número de cuota (sin historial)', 'cliente': snombre, 'cuit': cuit_raw, 'hoja': sname, 'hoja_fila': srow})
-                continue
+                max_hist = None
+                for hc in cuota_history_cols.get(p_sname, []):
+                    n_celda = max_cuota_celda(wb_deu_data[p_sname].cell(p_srow, hc).value)
+                    if n_celda is not None and (max_hist is None or n_celda > max_hist):
+                        max_hist = n_celda
+
+                if max_hist is not None:
+                    next_cuota = max_hist + 1
+                elif cuit_raw in cuit_to_cuota_previo:
+                    next_cuota = cuit_to_cuota_previo[cuit_raw] + 1
+                    log_fn(f'Fila {row_num}: cuota previa {cuit_to_cuota_previo[cuit_raw]}+1={next_cuota}')
+                elif cuit_raw in cuota_override:
+                    next_cuota = cuota_override[cuit_raw]
+                    log_fn(f'Fila {row_num}: cuota override {next_cuota} para {p_snombre}')
+                else:
+                    error_motivo = 'No se pudo determinar número de cuota (sin historial)'
+                    break
+            planes.append((p_sname, p_srow, p_snombre, p_teo, next_cuota, cnt))
+
+        if error_motivo:
+            ambiguous.append({'row': row_num, 'motivo': error_motivo, 'cliente': snombre, 'cuit': cuit_raw, 'hoja': sname, 'hoja_fila': srow})
+            continue
 
         fecha_dt = parse_date(fecha_val)
+        monto_por_cuota = round(monto_num / n_cuotas, 2 if es_usd else 0)
 
         todos_matches = cuit_index.get(cuit_raw, []) or _buscar_nombre(cuit_to_nombre_previo.get(cuit_raw, ''))
         nombres_distintos = {str(n).strip().upper() for _, _, n in todos_matches}
-        if len(todos_matches) > 1 and len(nombres_distintos) == 1:
-            lote_val = wb_deu_data[sname].cell(srow, cfg['lote_col']).value
-            lote_str = f' l{lote_val}' if lote_val is not None else ''
-        else:
-            lote_str = ''
+        usar_lote = len(todos_matches) > 1 and len(nombres_distintos) == 1
 
-        written_deu_rows[deu_key] = {'cuit': cuit_raw, 'last_cuota': next_cuota + n_cuotas - 1}
-        monto_por_cuota = round(monto_num / n_cuotas, 2 if es_usd else 0)
-        for i in range(n_cuotas):
-            results.append({
-                'imp_row': row_num,
-                'cuit': cuit_raw,
-                'cliente': snombre,
-                'lote_str': lote_str,
-                'hoja': sname,
-                'hoja_fila': srow,
-                'monto_real': monto_por_cuota,
-                'monto_teo': round(teo_num, 2 if es_usd else 0),
-                'diferencia': round(monto_por_cuota - teo_num, 2 if es_usd else 0),
-                'cuota': next_cuota + i,
-                'fecha': fecha_dt,
-            })
+        for p_sname, p_srow, p_snombre, p_teo, next_cuota, cnt in planes:
+            p_cfg = sheets_cfg[p_sname]
+            p_teo_num = p_teo if isinstance(p_teo, (int, float)) else 0
+            if usar_lote:
+                lote_val = wb_deu_data[p_sname].cell(p_srow, p_cfg['lote_col']).value
+                lote_str = f' l{lote_val}' if lote_val is not None else ''
+            else:
+                lote_str = ''
+            written_deu_rows[(p_sname, p_srow)] = {'cuit': cuit_raw, 'last_cuota': next_cuota + cnt - 1}
+            for i in range(cnt):
+                results.append({
+                    'imp_row': row_num,
+                    'cuit': cuit_raw,
+                    'cliente': p_snombre,
+                    'lote_str': lote_str,
+                    'hoja': p_sname,
+                    'hoja_fila': p_srow,
+                    'monto_real': monto_por_cuota,
+                    'monto_teo': round(p_teo_num, 2 if es_usd else 0),
+                    'diferencia': round(monto_por_cuota - p_teo_num, 2 if es_usd else 0),
+                    'cuota': next_cuota + i,
+                    'fecha': fecha_dt,
+                })
 
     wb_deu_data.close()
     wb_imp.close()
@@ -548,10 +597,28 @@ def aplicar(results, pago_menos, imp_bytes, deu_bytes, imp_sheet, sheets_cfg, pa
         imp_groups[r['imp_row']].append(r)
 
     for row_num, grupo in imp_groups.items():
-        cuotas = [r['cuota'] for r in grupo]
-        nombre_corto = str(grupo[0]['cliente'])[:38]
-        lote_str = grupo[0]['lote_str']
-        ws_edit.cell(row_num, 8).value = f"{nombre_corto}{lote_str} c{_format_cuotas(cuotas)}"
+        filas = defaultdict(list)
+        for r in grupo:
+            filas[(r['hoja'], r['hoja_fila'])].append(r)
+        if len(filas) == 1:
+            cuotas = [r['cuota'] for r in grupo]
+            nombre_corto = str(grupo[0]['cliente'])[:38]
+            label = f"{nombre_corto}{grupo[0]['lote_str']} c{_format_cuotas(cuotas)}"
+        else:
+            # Transferencia repartida en varios lotes: "Nombre l24 c16 y l25 c16"
+            segs = []
+            for key in sorted(filas):
+                rs = filas[key]
+                cuotas_fila = _format_cuotas([r['cuota'] for r in rs])
+                if rs[0]['lote_str']:
+                    segs.append(f"{rs[0]['lote_str'].strip()} c{cuotas_fila}")
+                else:
+                    segs.append(f"{str(rs[0]['cliente'])[:25]} c{cuotas_fila}")
+            if grupo[0]['lote_str']:
+                label = f"{str(grupo[0]['cliente'])[:38]} " + ' y '.join(segs)
+            else:
+                label = ' y '.join(segs)
+        ws_edit.cell(row_num, 8).value = label
         for cell in ws_edit[row_num]:
             cell.fill = YELLOW_FILL
 

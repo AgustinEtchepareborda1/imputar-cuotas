@@ -11,6 +11,7 @@ import datetime
 import shutil
 import os
 from comprobantes_helper import cargar_indice as _cargar_comprobantes
+from imputar_core import max_cuota_celda
 
 # ── CONFIG ──────────────────────────────────────────────────────────────────
 DRY_RUN = True   # ← cambiar a False para escribir realmente
@@ -523,10 +524,9 @@ for row in ws120.iter_rows(min_row=4, max_row=MAX_ROW):
         hist_cols = cuota_history_cols.get(sname, [])
         max_hist = None
         for hc in hist_cols:
-            val = ws_d.cell(srow, hc).value
-            if isinstance(val, (int, float)) and 0 < val <= 200:
-                if max_hist is None or val > max_hist:
-                    max_hist = int(val)
+            n_celda = max_cuota_celda(ws_d.cell(srow, hc).value)
+            if n_celda is not None and (max_hist is None or n_celda > max_hist):
+                max_hist = n_celda
 
         if max_hist is not None:
             next_cuota = max_hist + 1
