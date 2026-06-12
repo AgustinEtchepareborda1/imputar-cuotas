@@ -8,6 +8,12 @@ import pandas as pd
 
 from imputar_core import procesar, aplicar
 from comprobantes_helper import cargar_indice
+from mep_helper import cargar_mep
+
+
+@st.cache_data(ttl=3600)
+def cargar_mep_cacheado():
+    return cargar_mep()
 
 st.set_page_config(page_title="Imputar Cuotas - FINK", page_icon="📊", layout="wide")
 
@@ -133,10 +139,13 @@ try:
 
     if st.button('🔍 Simular', type='primary', use_container_width=True):
         comprobantes_cache = cargar_indice(CACHE_PATH) if os.path.exists(CACHE_PATH) else {}
+        mep_rates, mep_origen = ({}, None)
+        if not es_usd:
+            mep_rates, mep_origen = cargar_mep_cacheado()
         logs = []
 
         with st.spinner('Procesando...'):
-            results, pago_menos, pago_mas, ambiguous, sin_fila, mes_info, sheets_cfg = procesar(
+            results, pago_menos, pago_mas, ambiguous, sin_fila, usd_en_pesos, mes_info, sheets_cfg = procesar(
                 imp_bytes=imp_bytes,
                 deu_bytes=deu_bytes,
                 imp_sheet=semana,
@@ -145,6 +154,7 @@ try:
                 max_row=int(max_row),
                 cuota_override=cuota_override,
                 comprobantes_cache=comprobantes_cache,
+                mep_rates=mep_rates,
                 log_fn=logs.append,
             )
             st.session_state['sim'] = {
@@ -153,6 +163,8 @@ try:
                 'pago_mas': pago_mas,
                 'ambiguous': ambiguous,
                 'sin_fila': sin_fila,
+                'usd_en_pesos': usd_en_pesos,
+                'mep_origen': mep_origen,
                 'mes_info': mes_info,
                 'sheets_cfg': sheets_cfg,
                 'semana': semana,
@@ -184,13 +196,16 @@ try:
     mes_label = mes_vals[0] if mes_vals else '?'
     st.caption(f'Mes detectado en deudores: **{mes_label}**')
 
-    total = len(results) + len(pago_menos) + len(pago_mas) + len(ambiguous)
-    c1, c2, c3, c4, c5 = st.columns(5)
+    usd_en_pesos = sim.get('usd_en_pesos', [])
+
+    total = len(results) + len(pago_menos) + len(pago_mas) + len(ambiguous) + len(usd_en_pesos)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric('Total filas', total)
     c2.metric('✅ Para imputar', len(results))
-    c3.metric('⚠️ Pago menos', len(pago_menos))
-    c4.metric('🔺 Pago más', len(pago_mas))
-    c5.metric('❌ Ambiguos', len(ambiguous))
+    c3.metric('💵 USD en pesos', len(usd_en_pesos))
+    c4.metric('⚠️ Pago menos', len(pago_menos))
+    c5.metric('🔺 Pago más', len(pago_mas))
+    c6.metric('❌ Ambiguos', len(ambiguous))
 
     if results:
         st.subheader(f'✅ Para imputar ({len(results)})')
@@ -208,6 +223,40 @@ try:
                 'Hoja deudores': r['hoja'],
             })
         st.dataframe(pd.DataFrame(rows_ok), use_container_width=True, hide_index=True)
+
+    usd_aprobados_filas = []
+    if usd_en_pesos:
+        st.subheader(f'💵 Clientes USD fijo que pagaron en pesos ({len(usd_en_pesos)})')
+        origen = sim.get('mep_origen')
+        st.caption(
+            f'Cotización dólar MEP venta del día de la transferencia (fuente: misma serie que Ámbito Financiero'
+            f'{", " + origen if origen else ""}). Tildá **Imputar** en los que quieras escribir: '
+            'en USD fijo va el monto en pesos como "pago real", más N° de cuota y fecha.'
+        )
+        rows_usd = []
+        for e in usd_en_pesos:
+            rows_usd.append({
+                'Imputar': False,
+                'Fila': e['imp_row'],
+                'Cliente': str(e['cliente']),
+                'CUIT': e['cuit'],
+                'Fecha': e['fecha'].strftime('%d/%m/%Y') if e['fecha'] else '?',
+                'Pagó en $': fmt_monto(e['monto_pesos'], False),
+                'MEP venta': f"${e['mep']:,.2f}" if e['mep'] else 'sin dato',
+                'Equiv. U$D': fmt_monto(e['equiv_usd'], True) if e['equiv_usd'] is not None else '?',
+                'Teórico U$D': fmt_monto(e['teo_usd'], True) if e['teo_usd'] is not None else '?',
+                'Dif. U$D': fmt_dif(e['dif_usd'], True) if e['dif_usd'] is not None else '?',
+                'Cuota': e['cuota'],
+            })
+        df_usd = pd.DataFrame(rows_usd)
+        edited_usd = st.data_editor(
+            df_usd,
+            use_container_width=True,
+            hide_index=True,
+            disabled=[c for c in df_usd.columns if c != 'Imputar'],
+            key=f"usd_editor_{sim['semana']}",
+        )
+        usd_aprobados_filas = [int(f) for f, ok in zip(edited_usd['Fila'], edited_usd['Imputar']) if ok]
 
     if pago_menos:
         st.subheader(f'⚠️ Pago menos ({len(pago_menos)}) — se escribirá "PAGO MENOS" en col H')
@@ -256,20 +305,25 @@ try:
 
     # ── Confirmar e imputar ───────────────────────────────────────────────────
 
-    if not results and not pago_menos:
+    if not results and not pago_menos and not usd_en_pesos:
         st.info('No hay nada para imputar.')
         st.stop()
 
     st.divider()
-    st.warning(f'Esto escribirá **{len(results)}** imputaciones y **{len(pago_menos)}** "PAGO MENOS" en los archivos.')
+    aviso = f'Esto escribirá **{len(results)}** imputaciones y **{len(pago_menos)}** "PAGO MENOS" en los archivos.'
+    if usd_en_pesos:
+        aviso += f' USD en pesos habilitados: **{len(usd_aprobados_filas)}** de {len(usd_en_pesos)}.'
+    st.warning(aviso)
 
     if st.button('✅ Confirmar e Imputar', type='primary', use_container_width=True):
+        usd_aprobados = [e for e in usd_en_pesos if e['imp_row'] in usd_aprobados_filas]
         with st.spinner('Escribiendo archivos...'):
             imp_out, deu_out = aplicar(
                 results=sim['results'],
                 pago_menos=sim['pago_menos'],
                 pago_mas=sim.get('pago_mas', []),
                 sin_fila=sim.get('sin_fila', []),
+                usd_en_pesos=usd_aprobados,
                 imp_bytes=sim['imp_bytes'],
                 deu_bytes=sim['deu_bytes'],
                 imp_sheet=sim['semana'],

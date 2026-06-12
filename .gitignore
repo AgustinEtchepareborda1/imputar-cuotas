@@ -2,6 +2,7 @@
 datos/*.xlsx
 datos/*.bak
 datos/comprobantes_cache.json
+datos/mep_cache.json
 
 # Python
 __pycache__/

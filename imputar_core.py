@@ -9,6 +9,8 @@ import datetime
 import openpyxl
 from openpyxl.styles import PatternFill
 
+from mep_helper import mep_para_fecha
+
 YELLOW_FILL = PatternFill(patternType='solid', fgColor='FFFF00')
 
 MESES_ES = {
@@ -303,11 +305,17 @@ def procesar(
     max_row=500,
     cuota_override=None,
     comprobantes_cache=None,
+    mep_rates=None,
     log_fn=None,
 ):
     """
     Corre la imputación en modo simulación.
-    Retorna (results, pago_menos, pago_mas, ambiguous, sin_fila, mes_info, sheets_cfg).
+    Retorna (results, pago_menos, pago_mas, ambiguous, sin_fila, usd_en_pesos, mes_info, sheets_cfg).
+
+    usd_en_pesos: clientes de la hoja '$  USD fijo' que pagaron en pesos
+    (CUIT no está en las hojas de pesos pero sí en USD fijo). Se convierte el
+    monto por el dólar MEP venta del día (mep_rates: dict 'YYYY-MM-DD' -> venta)
+    y se reporta para que el usuario los habilite uno por uno.
     """
     if tolerance is None:
         tolerance = 5 if es_usd else 3000
@@ -332,6 +340,15 @@ def procesar(
     cuit_index, nombre_index, cuota_history_cols = build_indices(wb_deu_data, sheets_cfg)
     log_fn(f'{len(cuit_index)} CUITs indexados en deudores')
 
+    # En corridas de pesos, indexar también la hoja USD fijo para detectar
+    # clientes USD que pagan su cuota en pesos (conversión por dólar MEP)
+    usd_cuit_index, usd_hist_cols, usd_cfgs = {}, {}, {}
+    if not es_usd:
+        usd_cfgs, _ = build_sheets_cfg(wb_deu_data, SHEETS_BASE_USD, year=tx_year, month=tx_month)
+        if usd_cfgs:
+            usd_cuit_index, _, usd_hist_cols = build_indices(wb_deu_data, usd_cfgs)
+            log_fn(f'{len(usd_cuit_index)} CUITs indexados en USD fijo')
+
     cuit_to_nombre_previo, cuit_to_cuota_previo = build_previo(wb_imp, imp_sheet, es_usd)
     log_fn(f'{len(cuit_to_nombre_previo)} CUITs con nombre desde hojas anteriores')
     log_fn(f'{len(comprobantes_cache)} CUITs en cache de comprobantes')
@@ -345,6 +362,7 @@ def procesar(
     pago_menos = []
     pago_mas   = []
     sin_fila   = []  # nombre conocido pero sin fila en deudores → prellena col H sin amarillo
+    usd_en_pesos = []  # clientes USD fijo que pagaron en pesos (conversión MEP)
     written_deu_rows = {}  # (sname, srow) -> {'cuit': str, 'last_cuota': int}
 
     EXCESO_LIMITE   = 50 if es_usd else 50_000   # exceso máximo para imputar normalmente
@@ -373,6 +391,70 @@ def procesar(
             continue
 
         matches = cuit_index.get(cuit_raw, [])
+
+        # Cliente de USD fijo pagando en pesos: el CUIT no está en las hojas de
+        # pesos pero sí en la hoja USD. Convertir por MEP y reportar aparte.
+        if not matches and cuit_raw in usd_cuit_index:
+            umatches = usd_cuit_index[cuit_raw]
+            # elegir la primera fila sin imputar este mes (real y cuota vacíos)
+            destino = None
+            for (u_sname, u_srow, u_snombre) in umatches:
+                u_cfg = usd_cfgs[u_sname]
+                u_real = wb_deu_data[u_sname].cell(u_srow, u_cfg['real_col']).value
+                u_cuota_act = wb_deu_data[u_sname].cell(u_srow, u_cfg['cuota_col']).value
+                ya_usada = (u_sname, u_srow) in written_deu_rows
+                if u_real is None and not isinstance(u_cuota_act, (int, float)) and not ya_usada:
+                    destino = (u_sname, u_srow, u_snombre, u_cuota_act)
+                    break
+            if destino is None:
+                ambiguous.append({'row': row_num, 'motivo': f'CUIT {cuit_raw} en USD fijo pero el mes ya está imputado', 'cliente': umatches[0][2], 'cuit': cuit_raw, 'monto': monto_val})
+                continue
+
+            u_sname, u_srow, u_snombre, u_cuota_act = destino
+            u_cfg = usd_cfgs[u_sname]
+            fecha_dt = parse_date(fecha_val)
+            tasa, tasa_fecha = mep_para_fecha(mep_rates or {}, fecha_dt) if fecha_dt else (None, None)
+
+            monto_num = monto_val if isinstance(monto_val, (int, float)) else 0
+            teo_usd = wb_deu_data[u_sname].cell(u_srow, u_cfg['teo_col']).value
+            teo_usd = teo_usd if isinstance(teo_usd, (int, float)) else None
+            equiv = round(monto_num / tasa, 2) if (tasa and monto_num) else None
+            dif = round(equiv - teo_usd, 2) if (equiv is not None and teo_usd is not None) else None
+
+            # número de cuota: misma lógica que el flujo normal, sobre la fila USD
+            if isinstance(u_cuota_act, str) and 'parte' in u_cuota_act.lower():
+                m = re.search(r'\d+', u_cuota_act)
+                next_cuota = int(m.group()) + 1 if m else None
+            else:
+                max_hist = None
+                for hc in usd_hist_cols.get(u_sname, []):
+                    n_celda = max_cuota_celda(wb_deu_data[u_sname].cell(u_srow, hc).value)
+                    if n_celda is not None and (max_hist is None or n_celda > max_hist):
+                        max_hist = n_celda
+                next_cuota = max_hist + 1 if max_hist is not None else None
+
+            if next_cuota is None:
+                ambiguous.append({'row': row_num, 'motivo': f'CUIT {cuit_raw} en USD fijo (pagó en pesos) pero no se pudo determinar cuota', 'cliente': u_snombre, 'cuit': cuit_raw, 'monto': monto_val, 'hoja': u_sname, 'hoja_fila': u_srow})
+                continue
+
+            usd_en_pesos.append({
+                'imp_row': row_num,
+                'cuit': cuit_raw,
+                'cliente': u_snombre,
+                'hoja': u_sname,
+                'hoja_fila': u_srow,
+                'fecha': fecha_dt,
+                'monto_pesos': monto_num,
+                'mep': tasa,
+                'mep_fecha': tasa_fecha,
+                'equiv_usd': equiv,
+                'teo_usd': teo_usd,
+                'dif_usd': dif,
+                'cuota': next_cuota,
+            })
+            written_deu_rows[(u_sname, u_srow)] = {'cuit': cuit_raw, 'last_cuota': next_cuota}
+            continue
+
         if not matches:
             nombre_previo = cuit_to_nombre_previo.get(cuit_raw)
             if nombre_previo:
@@ -560,7 +642,11 @@ def procesar(
     wb_deu_data.close()
     wb_imp.close()
 
-    return results, pago_menos, pago_mas, ambiguous, sin_fila, mes_info, sheets_cfg
+    # incluir la cfg de USD fijo para que aplicar() pueda escribir ahí
+    sheets_cfg_out = dict(sheets_cfg)
+    sheets_cfg_out.update(usd_cfgs)
+
+    return results, pago_menos, pago_mas, ambiguous, sin_fila, usd_en_pesos, mes_info, sheets_cfg_out
 
 
 def _format_cuotas(cuotas):
@@ -571,8 +657,12 @@ def _format_cuotas(cuotas):
     return ', '.join(str(c) for c in cuotas[:-1]) + f' y {cuotas[-1]}'
 
 
-def aplicar(results, pago_menos, imp_bytes, deu_bytes, imp_sheet, sheets_cfg, pago_mas=None, sin_fila=None):
-    """Carga los workbooks desde bytes, escribe y retorna (imp_bytes, deu_bytes)."""
+def aplicar(results, pago_menos, imp_bytes, deu_bytes, imp_sheet, sheets_cfg, pago_mas=None, sin_fila=None, usd_en_pesos=None):
+    """Carga los workbooks desde bytes, escribe y retorna (imp_bytes, deu_bytes).
+
+    usd_en_pesos: solo las entradas que el usuario habilitó. Escribe en la hoja
+    USD fijo el monto EN PESOS en "pago real", más cuota y fecha.
+    """
     from collections import defaultdict
     wb_imp = openpyxl.load_workbook(io.BytesIO(imp_bytes))
     wb_deu_edit = openpyxl.load_workbook(io.BytesIO(deu_bytes))
@@ -621,6 +711,23 @@ def aplicar(results, pago_menos, imp_bytes, deu_bytes, imp_sheet, sheets_cfg, pa
         ws_edit.cell(row_num, 8).value = label
         for cell in ws_edit[row_num]:
             cell.fill = YELLOW_FILL
+
+    # Clientes USD fijo que pagaron en pesos (solo los habilitados)
+    for e in (usd_en_pesos or []):
+        ws_edit.cell(e['imp_row'], 8).value = f"{str(e['cliente'])[:38]} c{e['cuota']}"
+        for cell in ws_edit[e['imp_row']]:
+            cell.fill = YELLOW_FILL
+        cfg = sheets_cfg[e['hoja']]
+        ws_deu = wb_deu_edit[e['hoja']]
+        for col, val in [
+            (cfg['real_col'],  e['monto_pesos']),
+            (cfg['cuota_col'], e['cuota']),
+            (cfg['fecha_col'], e['fecha']),
+        ]:
+            cell = ws_deu.cell(e['hoja_fila'], col)
+            fmt = cell.number_format
+            cell.value = val
+            cell.number_format = fmt
 
     # Deudores: agrupar por fila (mismo lote puede tener varias cuotas)
     deu_groups = defaultdict(list)
