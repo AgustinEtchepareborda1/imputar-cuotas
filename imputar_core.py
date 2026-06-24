@@ -487,6 +487,11 @@ def procesar(
                     ambiguous.append({'row': row_num, 'motivo': f'CUIT {cuit_raw} no encontrado en deudores, semanas anteriores ni comprobantes', 'concepto': str(concepto)[:60], 'monto': monto_val, 'fecha': fecha_val})
                     continue
 
+        # monto numérico para todas las decisiones de abajo
+        monto_num = monto_val if isinstance(monto_val, (int, float)) else 0
+
+        # reparto_lotes=True → una cuota a cada lote (cada uno con su teórico)
+        reparto_lotes = False
         if len(matches) > 1:
             candidatos = []
             for (sname, srow, snombre) in matches:
@@ -500,22 +505,27 @@ def procesar(
             if not sin_imputar:
                 ambiguous.append({'row': row_num, 'motivo': 'Todos los matches ya tienen el mes imputado', 'cuit': cuit_raw, 'monto': monto_val, 'matches': [(n, t) for _, _, n, t, _ in candidatos]})
                 continue
-            if len(sin_imputar) > 1:
-                mejor = min(sin_imputar, key=lambda x: abs((x[3] or 0) - (monto_val or 0)))
-                dif_mejor = abs((mejor[3] or 0) - (monto_val or 0))
-                empate = [x for x in sin_imputar if x != mejor and abs(abs((x[3] or 0) - (monto_val or 0)) - dif_mejor) < (0.01 if es_usd else 1)]
-                if empate:
-                    disponibles = [x for x in sin_imputar if (x[0], x[1]) not in written_deu_rows]
-                    if not disponibles:
-                        ambiguous.append({'row': row_num, 'motivo': 'Todos los lotes ya asignados en este run', 'cuit': cuit_raw, 'monto': monto_val, 'matches': [(n, t) for _, _, n, t, _ in sin_imputar]})
-                        continue
-                    # Lotes empatados: si la transferencia cubre varias cuotas,
-                    # se reparten entre estos lotes (una por lote) más abajo
+
+            disponibles = [x for x in sin_imputar if (x[0], x[1]) not in written_deu_rows]
+            if not disponibles:
+                ambiguous.append({'row': row_num, 'motivo': 'Todos los lotes ya asignados en este run', 'cuit': cuit_raw, 'monto': monto_val, 'matches': [(n, t) for _, _, n, t, _ in sin_imputar]})
+                continue
+
+            if len(disponibles) > 1:
+                # ¿El monto cubre la SUMA de los teóricos de los lotes sin imputar?
+                # → repartir una cuota a cada lote (cada uno con su propio teórico).
+                # No exige teóricos iguales (antes solo repartía si "empataban").
+                suma_teo = sum((t or 0) for _, _, _, t, _ in disponibles)
+                multi_tol = max(tolerance, suma_teo * MULTI_TOL_RATIO)
+                if suma_teo > 0 and abs(monto_num - suma_teo) <= multi_tol:
                     targets = sorted(disponibles, key=lambda x: (x[0], x[1]))
+                    reparto_lotes = True
                 else:
-                    targets = [mejor]
+                    # No alcanza para todos los lotes (pagó una sola cuota o un
+                    # monto raro): imputar al lote cuyo teórico mejor coincide.
+                    targets = [min(disponibles, key=lambda x: abs((x[3] or 0) - monto_num))]
             else:
-                targets = [sin_imputar[0]]
+                targets = [disponibles[0]]
         else:
             sname, srow, snombre = matches[0]
             cfg = sheets_cfg[sname]
@@ -537,39 +547,42 @@ def procesar(
             ambiguous.append({'row': row_num, 'motivo': f'Destino duplicado (distinto CUIT) en {sname} fila {srow}', 'cliente': snombre, 'cuit': cuit_raw, 'monto': monto_val})
             continue
 
-        monto_num = monto_val if isinstance(monto_val, (int, float)) else 0
         teo_num = teo_val if isinstance(teo_val, (int, float)) else 0
 
-        if monto_num < teo_num and (teo_num - monto_num) > tolerance:
-            pago_menos.append({'row': row_num, 'cliente': snombre, 'cuit': cuit_raw, 'transferido': monto_num, 'teorico': round(teo_num, 2 if es_usd else 0), 'diferencia': round(teo_num - monto_num, 2 if es_usd else 0)})
-            continue
-
-        # Exceso positivo: verificar si es múltiplo del teórico o excede el límite
-        n_cuotas = 1
-        if teo_num > 0 and monto_num > teo_num + tolerance:
-            exceso = monto_num - teo_num
-            n = round(monto_num / teo_num)
-            multi_tol = max(tolerance, teo_num * MULTI_TOL_RATIO)
-            if n >= 2 and abs(monto_num - n * teo_num) <= multi_tol:
-                n_cuotas = n
-            elif exceso > EXCESO_LIMITE:
-                pago_mas.append({'row': row_num, 'cliente': snombre, 'cuit': cuit_raw, 'transferido': monto_num, 'teorico': round(teo_num, 2 if es_usd else 0), 'diferencia': round(exceso, 2 if es_usd else 0)})
+        if reparto_lotes:
+            # Una cuota a cada lote; cada lote lleva su propio teórico como pago real.
+            usar = targets
+            counts = [1] * len(usar)
+            montos_por_lote = [t if isinstance(t, (int, float)) else 0
+                               for _, _, _, t, _ in usar]
+        else:
+            if monto_num < teo_num and (teo_num - monto_num) > tolerance:
+                pago_menos.append({'row': row_num, 'cliente': snombre, 'cuit': cuit_raw, 'transferido': monto_num, 'teorico': round(teo_num, 2 if es_usd else 0), 'diferencia': round(teo_num - monto_num, 2 if es_usd else 0)})
                 continue
 
-        # Si la transferencia cubre N cuotas y hay varios lotes empatados
-        # disponibles, repartir las cuotas entre los lotes (una por lote)
-        if n_cuotas > 1 and len(targets) > 1:
-            usar = targets[:min(n_cuotas, len(targets))]
-        else:
+            # Exceso positivo: verificar si es múltiplo del teórico o excede el límite.
+            # (Solo aplica a UN lote: el reparto entre lotes ya se decidió arriba.)
+            n_cuotas = 1
+            if teo_num > 0 and monto_num > teo_num + tolerance:
+                exceso = monto_num - teo_num
+                n = round(monto_num / teo_num)
+                multi_tol = max(tolerance, teo_num * MULTI_TOL_RATIO)
+                if n >= 2 and abs(monto_num - n * teo_num) <= multi_tol:
+                    n_cuotas = n
+                elif exceso > EXCESO_LIMITE:
+                    pago_mas.append({'row': row_num, 'cliente': snombre, 'cuit': cuit_raw, 'transferido': monto_num, 'teorico': round(teo_num, 2 if es_usd else 0), 'diferencia': round(exceso, 2 if es_usd else 0)})
+                    continue
+
             usar = [targets[0]]
-        base, resto = divmod(n_cuotas, len(usar))
-        counts = [base + (1 if i < resto else 0) for i in range(len(usar))]
+            counts = [n_cuotas]
+            monto_por_cuota = round(monto_num / n_cuotas, 2 if es_usd else 0)
+            montos_por_lote = [monto_por_cuota]
 
         # Determinar la cuota de cada fila destino sin tocar estado, para poder
         # abortar limpio si alguna falla
         planes = []
         error_motivo = None
-        for (p_sname, p_srow, p_snombre, p_teo, _p_real), cnt in zip(usar, counts):
+        for (p_sname, p_srow, p_snombre, p_teo, _p_real), cnt, monto_lote in zip(usar, counts, montos_por_lote):
             p_cfg = sheets_cfg[p_sname]
             prev = written_deu_rows.get((p_sname, p_srow))
             cuota_col_val = wb_deu_data[p_sname].cell(p_srow, p_cfg['cuota_col']).value
@@ -602,20 +615,19 @@ def procesar(
                 else:
                     error_motivo = 'No se pudo determinar número de cuota (sin historial)'
                     break
-            planes.append((p_sname, p_srow, p_snombre, p_teo, next_cuota, cnt))
+            planes.append((p_sname, p_srow, p_snombre, p_teo, next_cuota, cnt, monto_lote))
 
         if error_motivo:
             ambiguous.append({'row': row_num, 'motivo': error_motivo, 'cliente': snombre, 'cuit': cuit_raw, 'hoja': sname, 'hoja_fila': srow})
             continue
 
         fecha_dt = parse_date(fecha_val)
-        monto_por_cuota = round(monto_num / n_cuotas, 2 if es_usd else 0)
 
         todos_matches = cuit_index.get(cuit_raw, []) or _buscar_nombre(cuit_to_nombre_previo.get(cuit_raw, ''))
         nombres_distintos = {str(n).strip().upper() for _, _, n in todos_matches}
         usar_lote = len(todos_matches) > 1 and len(nombres_distintos) == 1
 
-        for p_sname, p_srow, p_snombre, p_teo, next_cuota, cnt in planes:
+        for p_sname, p_srow, p_snombre, p_teo, next_cuota, cnt, monto_lote in planes:
             p_cfg = sheets_cfg[p_sname]
             p_teo_num = p_teo if isinstance(p_teo, (int, float)) else 0
             if usar_lote:
@@ -632,9 +644,9 @@ def procesar(
                     'lote_str': lote_str,
                     'hoja': p_sname,
                     'hoja_fila': p_srow,
-                    'monto_real': monto_por_cuota,
+                    'monto_real': monto_lote,
                     'monto_teo': round(p_teo_num, 2 if es_usd else 0),
-                    'diferencia': round(monto_por_cuota - p_teo_num, 2 if es_usd else 0),
+                    'diferencia': round(monto_lote - p_teo_num, 2 if es_usd else 0),
                     'cuota': next_cuota + i,
                     'fecha': fecha_dt,
                 })
