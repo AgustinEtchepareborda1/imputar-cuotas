@@ -153,6 +153,18 @@ def detectar_columnas_mes(ws, header_row, year=None, month=None):
     return teo_col_match if teo_col_match is not None else teo_col_fallback
 
 
+def _col_por_header(ws, header_row, keywords):
+    """Primera columna cuyo header (normalizado) contiene alguna de keywords."""
+    for c in range(1, ws.max_column + 1):
+        h = ws.cell(header_row, c).value
+        if not h:
+            continue
+        hn = _norm(str(h))
+        if any(k in hn for k in keywords):
+            return c
+    return None
+
+
 def build_sheets_cfg(wb_deu_data, sheets_base, year=None, month=None):
     """Auto-detecta columnas del mes y construye sheets_cfg completo."""
     sheets_cfg = {}
@@ -166,6 +178,19 @@ def build_sheets_cfg(wb_deu_data, sheets_base, year=None, month=None):
         if teo_col is None:
             continue
         cfg = dict(base)
+        # Auto-detectar CUIT/Nombre/LOTE por header (los índices fijos se rompen
+        # si el archivo de deudores agrega/quita columnas). Se cae al valor base
+        # si no se encuentra el header.
+        hr = base['header_row']
+        cuit_c   = _col_por_header(ws, hr, ('cuit',))
+        nombre_c = _col_por_header(ws, hr, ('nombre',))
+        lote_c   = _col_por_header(ws, hr, ('lote',))
+        if cuit_c:
+            cfg['cuit_col'] = cuit_c
+        if nombre_c:
+            cfg['nombre_col'] = nombre_c
+        if lote_c:
+            cfg['lote_col'] = lote_c
         cfg['teo_col'] = teo_col
         cfg['real_col'] = teo_col + 1
         cfg['cuota_col'] = teo_col + 2
@@ -307,9 +332,15 @@ def procesar(
     comprobantes_cache=None,
     mep_rates=None,
     log_fn=None,
+    solo_mes=None,
 ):
     """
     Corre la imputación en modo simulación.
+
+    solo_mes: tupla (year, month) opcional. Si se pasa, se procesan SOLO las
+    transferencias fechadas en ese mes y se escribe en la columna de ese mes.
+    Sirve para semanas con cambio de mes en el medio (correr una pasada por mes).
+    Si es None, autodetecta el mes más frecuente (comportamiento histórico).
     Retorna (results, pago_menos, pago_mas, ambiguous, sin_fila, usd_en_pesos, mes_info, sheets_cfg).
 
     usd_en_pesos: clientes de la hoja '$  USD fijo' que pagaron en pesos
@@ -332,9 +363,13 @@ def procesar(
     wb_deu_data = openpyxl.load_workbook(io.BytesIO(deu_bytes), data_only=True)
     wb_imp = openpyxl.load_workbook(io.BytesIO(imp_bytes))
 
-    tx_year, tx_month = detectar_mes_transferencias(wb_imp[imp_sheet], max_row)
-    if tx_year:
-        log_fn(f'Mes detectado en transferencias: {MESES_ES.get(tx_month, "?")} {tx_year}')
+    if solo_mes:
+        tx_year, tx_month = solo_mes
+        log_fn(f'Mes forzado (solo_mes): {MESES_ES.get(tx_month, "?")} {tx_year}')
+    else:
+        tx_year, tx_month = detectar_mes_transferencias(wb_imp[imp_sheet], max_row)
+        if tx_year:
+            log_fn(f'Mes detectado en transferencias: {MESES_ES.get(tx_month, "?")} {tx_year}')
 
     sheets_cfg, mes_info = build_sheets_cfg(wb_deu_data, sheets_base, year=tx_year, month=tx_month)
     cuit_index, nombre_index, cuota_history_cols = build_indices(wb_deu_data, sheets_cfg)
@@ -381,6 +416,12 @@ def procesar(
 
         if is_row_yellow(ws_imp, row_num):
             continue
+
+        # Semana con cambio de mes: procesar solo las filas del mes pedido.
+        if solo_mes:
+            d_row = parse_date(fecha_val)
+            if not (d_row and d_row.year == solo_mes[0] and d_row.month == solo_mes[1]):
+                continue
 
         if col_h_val and ('PAGO MENOS' in str(col_h_val) or 'Saldo Disponible' in str(col_h_val)):
             continue
@@ -669,6 +710,18 @@ def _format_cuotas(cuotas):
     return ', '.join(str(c) for c in cuotas[:-1]) + f' y {cuotas[-1]}'
 
 
+def _set_cell(cell, val):
+    """Escribe val preservando el number_format de la celda. Excepción: si se
+    escribe una fecha en una celda 'General' (típico de una columna de un mes
+    nuevo aún sin formatear), se aplica formato de fecha para que no se vea como
+    número de serie."""
+    fmt = cell.number_format
+    cell.value = val
+    if isinstance(val, (datetime.datetime, datetime.date)) and fmt in (None, 'General'):
+        fmt = 'dd/mm/yyyy'
+    cell.number_format = fmt
+
+
 def aplicar(results, pago_menos, imp_bytes, deu_bytes, imp_sheet, sheets_cfg, pago_mas=None, sin_fila=None, usd_en_pesos=None):
     """Carga los workbooks desde bytes, escribe y retorna (imp_bytes, deu_bytes).
 
@@ -736,10 +789,7 @@ def aplicar(results, pago_menos, imp_bytes, deu_bytes, imp_sheet, sheets_cfg, pa
             (cfg['cuota_col'], e['cuota']),
             (cfg['fecha_col'], e['fecha']),
         ]:
-            cell = ws_deu.cell(e['hoja_fila'], col)
-            fmt = cell.number_format
-            cell.value = val
-            cell.number_format = fmt
+            _set_cell(ws_deu.cell(e['hoja_fila'], col), val)
 
     # Deudores: agrupar por fila (mismo lote puede tener varias cuotas)
     deu_groups = defaultdict(list)
@@ -755,10 +805,7 @@ def aplicar(results, pago_menos, imp_bytes, deu_bytes, imp_sheet, sheets_cfg, pa
             (cfg['cuota_col'], _format_cuotas(cuotas)),
             (cfg['fecha_col'], grupo[0]['fecha']),
         ]:
-            cell = ws_deu.cell(srow, col)
-            fmt = cell.number_format
-            cell.value = val
-            cell.number_format = fmt
+            _set_cell(ws_deu.cell(srow, col), val)
 
     imp_out = io.BytesIO()
     deu_out = io.BytesIO()
