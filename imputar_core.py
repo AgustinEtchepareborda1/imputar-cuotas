@@ -333,6 +333,7 @@ def procesar(
     mep_rates=None,
     log_fn=None,
     solo_mes=None,
+    forzar_col_mes=None,
 ):
     """
     Corre la imputación en modo simulación.
@@ -341,6 +342,12 @@ def procesar(
     transferencias fechadas en ese mes y se escribe en la columna de ese mes.
     Sirve para semanas con cambio de mes en el medio (correr una pasada por mes).
     Si es None, autodetecta el mes más frecuente (comportamiento histórico).
+
+    forzar_col_mes: tupla (year, month) opcional. Fuerza la COLUMNA del mes a
+    escribir, pero SIN filtrar filas por fecha (procesa todas). Útil para la
+    2da pasada de una semana con cambio de mes: "todo lo que no se imputó al mes
+    previo va al mes nuevo" (lógica de próxima cuota impaga). Ignorado si se pasa
+    solo_mes.
     Retorna (results, pago_menos, pago_mas, ambiguous, sin_fila, usd_en_pesos, mes_info, sheets_cfg).
 
     usd_en_pesos: clientes de la hoja '$  USD fijo' que pagaron en pesos
@@ -366,6 +373,9 @@ def procesar(
     if solo_mes:
         tx_year, tx_month = solo_mes
         log_fn(f'Mes forzado (solo_mes): {MESES_ES.get(tx_month, "?")} {tx_year}')
+    elif forzar_col_mes:
+        tx_year, tx_month = forzar_col_mes
+        log_fn(f'Columna forzada (forzar_col_mes): {MESES_ES.get(tx_month, "?")} {tx_year}')
     else:
         tx_year, tx_month = detectar_mes_transferencias(wb_imp[imp_sheet], max_row)
         if tx_year:
