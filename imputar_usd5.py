@@ -89,15 +89,34 @@ def normalize_str(s):
 
 
 def normalize_cuits(raw):
-    """Devuelve lista de strings de dígitos extraídos del campo CUIT."""
-    if not raw:
+    """Extrae todos los CUITs de una celda: guiones, '/' o texto libre entre CUITs."""
+    if raw is None or raw == '':
         return []
-    results = []
-    for part in str(raw).split('/'):
-        digits = re.sub(r'[^0-9]', '', part.strip())
-        if len(digits) >= 10:   # CUITs válidos: 11 dígitos; también acepta 12
-            results.append(digits)
-    return results
+    if isinstance(raw, float) and raw.is_integer():
+        raw = int(raw)
+    s = str(raw)
+    # Unir grupos de dígitos conectados por guion/punto (con espacios sueltos
+    # alrededor) mientras no excedan los 12 dígitos de un CUIT.
+    results, cur, prev_end = [], '', None
+    for g in re.finditer(r'\d+', s):
+        sep = s[prev_end:g.start()] if prev_end is not None else None
+        unido = sep is not None and re.fullmatch(r'\s*[.\-]\s*', sep)
+        if cur and unido and len(cur) + len(g.group()) <= 12:
+            cur += g.group()
+        else:
+            if 10 <= len(cur) <= 12:
+                results.append(cur)
+            cur = g.group()
+        prev_end = g.end()
+    if 10 <= len(cur) <= 12:
+        results.append(cur)
+    if not results:
+        # formato raro (ej: dígitos separados solo por espacios): unir todo
+        for part in s.split('/'):
+            digits = re.sub(r'\D', '', part)
+            if len(digits) >= 10:
+                results.append(digits)
+    return list(dict.fromkeys(results))
 
 
 def is_row_yellow(ws, row_num):

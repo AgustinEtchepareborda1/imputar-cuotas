@@ -43,14 +43,41 @@ SHEETS_BASE_USD = {
 
 
 def normalize_cuits(raw):
-    if not raw:
+    """Extrae todos los CUITs de una celda de deudores.
+
+    Maneja guiones/puntos (20-34658691-6), varios CUITs separados por '/'
+    y celdas con texto libre entre CUITs
+    ('27-14742775-7 (esther) Eluen 20-44090800-5' → dos CUITs).
+    """
+    if raw is None or raw == '':
         return []
-    results = []
-    for part in str(raw).split('/'):
-        digits = re.sub(r'[^0-9]', '', part.strip())
-        if len(digits) >= 10:
-            results.append(digits)
-    return results
+    if isinstance(raw, float) and raw.is_integer():
+        raw = int(raw)
+    s = str(raw)
+    # Unir grupos de dígitos conectados por guion/punto (con espacios sueltos
+    # alrededor) mientras no excedan los 12 dígitos de un CUIT. Un guion entre
+    # dos CUITs completos ("20259477895 - 27267941594") no los une porque el
+    # resultado se pasaría de largo.
+    results, cur, prev_end = [], '', None
+    for g in re.finditer(r'\d+', s):
+        sep = s[prev_end:g.start()] if prev_end is not None else None
+        unido = sep is not None and re.fullmatch(r'\s*[.\-]\s*', sep)
+        if cur and unido and len(cur) + len(g.group()) <= 12:
+            cur += g.group()
+        else:
+            if 10 <= len(cur) <= 12:
+                results.append(cur)
+            cur = g.group()
+        prev_end = g.end()
+    if 10 <= len(cur) <= 12:
+        results.append(cur)
+    if not results:
+        # formato raro (ej: dígitos separados solo por espacios): unir todo
+        for part in s.split('/'):
+            digits = re.sub(r'\D', '', part)
+            if len(digits) >= 10:
+                results.append(digits)
+    return list(dict.fromkeys(results))
 
 
 def is_row_yellow(ws, row_num):

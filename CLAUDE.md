@@ -64,7 +64,7 @@ Hojas con cuotas en pesos (NO escribir en '$ USD fijo' desde el script pesos):
 
 Hoja USD (`$  USD fijo`, dos espacios): misma estructura, header en fila 3.
 
-CUITs en USD fijo pueden tener formato con guiones (`20-34658691-6`) o múltiples separados por `/`. El script los normaliza automáticamente.
+CUITs (en cualquier hoja) pueden tener formato con guiones (`20-34658691-6`), múltiples separados por `/`, `y` o texto libre (`27-14742775-7 (esther) Eluen 20-44090800-5`). El script extrae todos los CUITs de la celda automáticamente — un mismo CUIT puede aparecer en varios lotes (incluso con nombres distintos) y cada transferencia va a un lote libre.
 
 ## Cómo determina el script el número de cuota (regla actual)
 
