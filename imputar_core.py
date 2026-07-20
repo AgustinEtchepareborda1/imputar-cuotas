@@ -193,6 +193,49 @@ def detectar_columnas_mes(ws, header_row, year=None, month=None):
     return teo_col_match if teo_col_match is not None else teo_col_fallback
 
 
+# Tokens (nombre completo + abreviaturas) para reconocer el mes en un header.
+_MES_TOKENS = {
+    1: ('enero', 'ene'),      2: ('febrero', 'feb'),   3: ('marzo', 'mar'),
+    4: ('abril', 'abr'),      5: ('mayo', 'may'),      6: ('junio', 'jun'),
+    7: ('julio', 'jul'),      8: ('agosto', 'agost', 'ago'),
+    9: ('septiembre', 'setiembre', 'sept', 'set', 'sep'),
+    10: ('octubre', 'oct'),   11: ('noviembre', 'nov'), 12: ('diciembre', 'dic'),
+}
+
+
+def mapa_meses_columnas(ws, header_row):
+    """Retorna {(year, month): teo_col} parseando los headers 'teorico'.
+
+    Permite imputar cada transferencia en la columna del mes de SU fecha
+    (las hojas USD arrastran transferencias de varios meses en la misma hoja).
+    """
+    mapa = {}
+    for c in range(1, ws.max_column + 1):
+        h = ws.cell(header_row, c).value
+        if not h:
+            continue
+        hn = _norm(str(h))
+        if 'teorico' not in hn:
+            continue
+        yr = re.search(r'\b(20\d{2}|\d{2})\b', hn)
+        if not yr:
+            continue
+        y = int(yr.group(1))
+        year = y if y > 99 else 2000 + y
+        # Matchear por PALABRA (prefijo), no substring: 'ago' no debe matchear
+        # dentro de 'pago', ni 'dic' dentro de otra palabra.
+        palabras = re.findall(r'[a-z]+', hn)
+        mes = None
+        for num, toks in _MES_TOKENS.items():
+            if any(w.startswith(t) for w in palabras for t in toks):
+                mes = num
+                break
+        if mes is None:
+            continue
+        mapa[(year, mes)] = c
+    return mapa
+
+
 def _col_por_header(ws, header_row, keywords):
     """Primera columna cuyo header (normalizado) contiene alguna de keywords."""
     for c in range(1, ws.max_column + 1):
@@ -272,8 +315,9 @@ def build_indices(wb_deu_data, sheets_cfg):
         for c in range(1, ws_data.max_column + 1):
             h = ws_data.cell(cfg['header_row'], c).value
             if h and ('numero' in str(h).lower() or 'n°' in str(h).lower() or 'nro' in str(h).lower()) and 'cuota' in str(h).lower():
-                if c != cfg['cuota_col']:
-                    cols.append(c)
+                cols.append(c)
+        # Guarda TODAS las columnas de N° cuota; el loop excluye la del mes
+        # objetivo (que varía por fila cuando cada transferencia va a su propio mes).
         cuota_history_cols[sheet_name] = cols
 
     return cuit_index, nombre_index, cuota_history_cols
@@ -441,6 +485,34 @@ def procesar(
     def _buscar_nombre(nombre_str):
         return buscar_en_deudores_por_nombre(nombre_str, nombre_index)
 
+    # Mapa mes→columna por hoja: cada transferencia se imputa en la columna del
+    # mes de SU fecha. Si el mes de la transferencia no tiene columna en deudores,
+    # se cae a la del mes detectado (cfg base). solo_mes/forzar_col_mes fuerzan
+    # siempre esa columna (flujo de semana con cambio de mes controlado a mano).
+    col_maps = {}
+    for sname in list(sheets_cfg) + list(usd_cfgs):
+        try:
+            hr = (sheets_cfg.get(sname) or usd_cfgs.get(sname))['header_row']
+            col_maps[sname] = mapa_meses_columnas(wb_deu_data[sname], hr)
+        except (KeyError, TypeError):
+            col_maps[sname] = {}
+
+    forzar_columna = bool(solo_mes or forzar_col_mes)
+
+    def cols_de(sname, fecha_dt, base_cfg):
+        """Devuelve la cfg de columnas del mes de la transferencia (o la base)."""
+        if forzar_columna or fecha_dt is None:
+            return base_cfg
+        teo = col_maps.get(sname, {}).get((fecha_dt.year, fecha_dt.month))
+        if teo is None:
+            return base_cfg
+        cfg = dict(base_cfg)
+        cfg['teo_col'] = teo
+        cfg['real_col'] = teo + 1
+        cfg['cuota_col'] = teo + 2
+        cfg['fecha_col'] = teo + 3
+        return cfg
+
     ws_imp = wb_imp[imp_sheet]
     results    = []
     ambiguous  = []
@@ -463,14 +535,14 @@ def procesar(
             continue
 
         row_num = row[0].row
+        fecha_dt = parse_date(fecha_val)
 
         if is_row_yellow(ws_imp, row_num):
             continue
 
         # Semana con cambio de mes: procesar solo las filas del mes pedido.
         if solo_mes:
-            d_row = parse_date(fecha_val)
-            if not (d_row and d_row.year == solo_mes[0] and d_row.month == solo_mes[1]):
+            if not (fecha_dt and fecha_dt.year == solo_mes[0] and fecha_dt.month == solo_mes[1]):
                 continue
 
         if col_h_val and ('PAGO MENOS' in str(col_h_val) or 'Saldo Disponible' in str(col_h_val)):
@@ -490,20 +562,18 @@ def procesar(
             # elegir la primera fila sin imputar este mes (real y cuota vacíos)
             destino = None
             for (u_sname, u_srow, u_snombre) in umatches:
-                u_cfg = usd_cfgs[u_sname]
+                u_cfg = cols_de(u_sname, fecha_dt, usd_cfgs[u_sname])
                 u_real = wb_deu_data[u_sname].cell(u_srow, u_cfg['real_col']).value
                 u_cuota_act = wb_deu_data[u_sname].cell(u_srow, u_cfg['cuota_col']).value
                 ya_usada = (u_sname, u_srow) in written_deu_rows
                 if u_real is None and not isinstance(u_cuota_act, (int, float)) and not ya_usada:
-                    destino = (u_sname, u_srow, u_snombre, u_cuota_act)
+                    destino = (u_sname, u_srow, u_snombre, u_cuota_act, u_cfg)
                     break
             if destino is None:
                 ambiguous.append({'row': row_num, 'motivo': f'CUIT {cuit_raw} en USD fijo pero el mes ya está imputado', 'cliente': umatches[0][2], 'cuit': cuit_raw, 'monto': monto_val})
                 continue
 
-            u_sname, u_srow, u_snombre, u_cuota_act = destino
-            u_cfg = usd_cfgs[u_sname]
-            fecha_dt = parse_date(fecha_val)
+            u_sname, u_srow, u_snombre, u_cuota_act, u_cfg = destino
             tasa, tasa_fecha = mep_para_fecha(mep_rates or {}, fecha_dt) if fecha_dt else (None, None)
 
             monto_num = monto_val if isinstance(monto_val, (int, float)) else 0
@@ -519,6 +589,8 @@ def procesar(
             else:
                 max_hist = None
                 for hc in usd_hist_cols.get(u_sname, []):
+                    if hc == u_cfg['cuota_col']:
+                        continue
                     n_celda = max_cuota_celda(wb_deu_data[u_sname].cell(u_srow, hc).value)
                     if n_celda is not None and (max_hist is None or n_celda > max_hist):
                         max_hist = n_celda
@@ -542,6 +614,9 @@ def procesar(
                 'teo_usd': teo_usd,
                 'dif_usd': dif,
                 'cuota': next_cuota,
+                'real_col': u_cfg['real_col'],
+                'cuota_col': u_cfg['cuota_col'],
+                'fecha_col': u_cfg['fecha_col'],
             })
             written_deu_rows[(u_sname, u_srow)] = {'cuit': cuit_raw, 'last_cuota': next_cuota}
             continue
@@ -586,7 +661,7 @@ def procesar(
         if len(matches) > 1:
             candidatos = []
             for (sname, srow, snombre) in matches:
-                cfg = sheets_cfg[sname]
+                cfg = cols_de(sname, fecha_dt, sheets_cfg[sname])
                 ws_d = wb_deu_data[sname]
                 teo = ws_d.cell(srow, cfg['teo_col']).value
                 real = ws_d.cell(srow, cfg['real_col']).value
@@ -619,7 +694,7 @@ def procesar(
                 targets = [disponibles[0]]
         else:
             sname, srow, snombre = matches[0]
-            cfg = sheets_cfg[sname]
+            cfg = cols_de(sname, fecha_dt, sheets_cfg[sname])
             ws_d = wb_deu_data[sname]
             teo = ws_d.cell(srow, cfg['teo_col']).value
             real = ws_d.cell(srow, cfg['real_col']).value
@@ -674,7 +749,7 @@ def procesar(
         planes = []
         error_motivo = None
         for (p_sname, p_srow, p_snombre, p_teo, _p_real), cnt, monto_lote in zip(usar, counts, montos_por_lote):
-            p_cfg = sheets_cfg[p_sname]
+            p_cfg = cols_de(p_sname, fecha_dt, sheets_cfg[p_sname])
             prev = written_deu_rows.get((p_sname, p_srow))
             cuota_col_val = wb_deu_data[p_sname].cell(p_srow, p_cfg['cuota_col']).value
 
@@ -691,6 +766,8 @@ def procesar(
             else:
                 max_hist = None
                 for hc in cuota_history_cols.get(p_sname, []):
+                    if hc == p_cfg['cuota_col']:
+                        continue
                     n_celda = max_cuota_celda(wb_deu_data[p_sname].cell(p_srow, hc).value)
                     if n_celda is not None and (max_hist is None or n_celda > max_hist):
                         max_hist = n_celda
@@ -712,14 +789,12 @@ def procesar(
             ambiguous.append({'row': row_num, 'motivo': error_motivo, 'cliente': snombre, 'cuit': cuit_raw, 'hoja': sname, 'hoja_fila': srow})
             continue
 
-        fecha_dt = parse_date(fecha_val)
-
         todos_matches = cuit_index.get(cuit_raw, []) or _buscar_nombre(cuit_to_nombre_previo.get(cuit_raw, ''))
         nombres_distintos = {str(n).strip().upper() for _, _, n in todos_matches}
         usar_lote = len(todos_matches) > 1 and len(nombres_distintos) == 1
 
         for p_sname, p_srow, p_snombre, p_teo, next_cuota, cnt, monto_lote in planes:
-            p_cfg = sheets_cfg[p_sname]
+            p_cfg = cols_de(p_sname, fecha_dt, sheets_cfg[p_sname])
             p_teo_num = p_teo if isinstance(p_teo, (int, float)) else 0
             if usar_lote:
                 lote_val = wb_deu_data[p_sname].cell(p_srow, p_cfg['lote_col']).value
@@ -740,6 +815,9 @@ def procesar(
                     'diferencia': round(monto_lote - p_teo_num, 2 if es_usd else 0),
                     'cuota': next_cuota + i,
                     'fecha': fecha_dt,
+                    'real_col': p_cfg['real_col'],
+                    'cuota_col': p_cfg['cuota_col'],
+                    'fecha_col': p_cfg['fecha_col'],
                 })
 
     wb_deu_data.close()
@@ -835,25 +913,28 @@ def aplicar(results, pago_menos, imp_bytes, deu_bytes, imp_sheet, sheets_cfg, pa
         cfg = sheets_cfg[e['hoja']]
         ws_deu = wb_deu_edit[e['hoja']]
         for col, val in [
-            (cfg['real_col'],  e['monto_pesos']),
-            (cfg['cuota_col'], e['cuota']),
-            (cfg['fecha_col'], e['fecha']),
+            (e.get('real_col',  cfg['real_col']),  e['monto_pesos']),
+            (e.get('cuota_col', cfg['cuota_col']), e['cuota']),
+            (e.get('fecha_col', cfg['fecha_col']), e['fecha']),
         ]:
             _set_cell(ws_deu.cell(e['hoja_fila'], col), val)
 
-    # Deudores: agrupar por fila (mismo lote puede tener varias cuotas)
+    # Deudores: agrupar por fila + columna de mes. Una misma fila (lote) puede
+    # recibir cuotas de meses distintos en este run (transferencias de junio y
+    # julio del mismo cliente) → cada mes va a su propio bloque de columnas.
     deu_groups = defaultdict(list)
     for r in results:
-        deu_groups[(r['hoja'], r['hoja_fila'])].append(r)
+        real_col = r.get('real_col', sheets_cfg[r['hoja']]['real_col'])
+        deu_groups[(r['hoja'], r['hoja_fila'], real_col)].append(r)
 
-    for (sname, srow), grupo in deu_groups.items():
+    for (sname, srow, _rc), grupo in deu_groups.items():
         cfg = sheets_cfg[sname]
         ws_deu = wb_deu_edit[sname]
         cuotas = [r['cuota'] for r in grupo]
         for col, val in [
-            (cfg['real_col'],  sum(r['monto_real'] for r in grupo)),
-            (cfg['cuota_col'], _format_cuotas(cuotas)),
-            (cfg['fecha_col'], grupo[0]['fecha']),
+            (grupo[0].get('real_col',  cfg['real_col']),  sum(r['monto_real'] for r in grupo)),
+            (grupo[0].get('cuota_col', cfg['cuota_col']), _format_cuotas(cuotas)),
+            (grupo[0].get('fecha_col', cfg['fecha_col']), grupo[0]['fecha']),
         ]:
             _set_cell(ws_deu.cell(srow, col), val)
 
