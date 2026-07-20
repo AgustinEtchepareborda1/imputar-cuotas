@@ -142,13 +142,26 @@ def max_cuota_celda(val):
 
 
 def detectar_mes_transferencias(ws_imp, max_row=500):
-    """Lee col A de imputaciones y retorna (year, month) más frecuente, o (None, None)."""
+    """Lee col A de imputaciones y retorna (year, month) más frecuente, o (None, None).
+
+    Solo cuenta filas PENDIENTES (no amarillas): las hojas —sobre todo las USD—
+    son acumulativas y arrastran transferencias ya imputadas de meses anteriores.
+    Contar todas hacía que el mes detectado fuera un mes viejo ya imputado y el
+    script reportara "mes ya imputado" para todo sin imputar nada.
+    Si no hubiera filas pendientes, cae a contar todas (comportamiento previo).
+    """
     from collections import Counter
     conteo = Counter()
+    conteo_todas = Counter()
     for row in ws_imp.iter_rows(min_row=4, max_row=max_row, max_col=1):
         dt = parse_date(row[0].value)
-        if dt:
+        if not dt:
+            continue
+        conteo_todas[(dt.year, dt.month)] += 1
+        if not is_row_yellow(ws_imp, row[0].row):
             conteo[(dt.year, dt.month)] += 1
+    if not conteo:
+        conteo = conteo_todas
     if not conteo:
         return None, None
     (year, month), _ = conteo.most_common(1)[0]
