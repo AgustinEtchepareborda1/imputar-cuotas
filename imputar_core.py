@@ -486,22 +486,24 @@ def procesar(
         return buscar_en_deudores_por_nombre(nombre_str, nombre_index)
 
     # Mapa mes→columna por hoja: cada transferencia se imputa en la columna del
-    # mes de SU fecha. Si el mes de la transferencia no tiene columna en deudores,
-    # se cae a la del mes detectado (cfg base). solo_mes/forzar_col_mes fuerzan
-    # siempre esa columna (flujo de semana con cambio de mes controlado a mano).
+    # mes de SU fecha. SOLO en USD, porque su hoja acumula transferencias de
+    # varios meses. En pesos cada hoja "S NNN" es de una sola semana/mes, así que
+    # se usa siempre la columna del mes detectado (comportamiento previo estable;
+    # evita que un teórico duplicado/con fórmula del deudores rompa la lectura).
+    # solo_mes/forzar_col_mes fuerzan siempre la columna (flujo de mes partido).
     col_maps = {}
-    for sname in list(sheets_cfg) + list(usd_cfgs):
-        try:
-            hr = (sheets_cfg.get(sname) or usd_cfgs.get(sname))['header_row']
-            col_maps[sname] = mapa_meses_columnas(wb_deu_data[sname], hr)
-        except (KeyError, TypeError):
-            col_maps[sname] = {}
-
-    forzar_columna = bool(solo_mes or forzar_col_mes)
+    ruteo_por_mes = es_usd and not (solo_mes or forzar_col_mes)
+    if ruteo_por_mes:
+        for sname in list(sheets_cfg) + list(usd_cfgs):
+            try:
+                hr = (sheets_cfg.get(sname) or usd_cfgs.get(sname))['header_row']
+                col_maps[sname] = mapa_meses_columnas(wb_deu_data[sname], hr)
+            except (KeyError, TypeError):
+                col_maps[sname] = {}
 
     def cols_de(sname, fecha_dt, base_cfg):
         """Devuelve la cfg de columnas del mes de la transferencia (o la base)."""
-        if forzar_columna or fecha_dt is None:
+        if not ruteo_por_mes or fecha_dt is None:
             return base_cfg
         teo = col_maps.get(sname, {}).get((fecha_dt.year, fecha_dt.month))
         if teo is None:
