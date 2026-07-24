@@ -939,6 +939,11 @@ def aplicar(results, pago_menos, imp_bytes, deu_bytes, imp_sheet, sheets_cfg, pa
             (grupo[0].get('fecha_col', cfg['fecha_col']), grupo[0]['fecha']),
         ]:
             _set_cell(ws_deu.cell(srow, col), val)
+        # Si se imputan 2+ cuotas en la misma celda (ej "26 y 27"), la fórmula
+        # de la columna MAYOR CUOTA no sabe leer ese texto → escribir la cuota
+        # más alta directo en esa columna, pisando la fórmula/valor previo.
+        if len(cuotas) > 1:
+            _set_cell(ws_deu.cell(srow, cfg['max_cuota_col']), max(cuotas))
 
     imp_out = io.BytesIO()
     deu_out = io.BytesIO()
